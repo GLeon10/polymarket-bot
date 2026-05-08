@@ -151,11 +151,41 @@ Bot rodando em VPS DigitalOcean (159.89.232.170) como serviço systemd:
 
 ---
 
-## Estratégias B (fase futura)
+## Estratégias B (ativas para teste)
 
-Inativas. Gatilho: $80–100 lucro líquido acumulado com scanner principal.
-Lucro vira banca separada — capital original nunca exposto a B.
-B1 weather oracle ativa primeiro. B2 esports oracle após B1 validado.
+Todas as estratégias B rodam em paralelo com A desde o início, sem gatilho de lucro.
+Capital de B ainda não alocado do principal — operam em dry-run para validação.
+
+### B1 — Weather Oracle
+Compara previsão Open-Meteo com preço implícito de mercados de temperatura.
+Divergência > 20% + preço ≤ 40¢ + liquidez > $100 + resolução ≤ 24h → entrada.
+Cidades monitoradas: New York, London, Seoul, Hong Kong, Madrid. Ciclo: 1h.
+
+### B2 — Esports Oracle (LoL + Dota 2)
+Compara win-rate histórico (LoL Esports API / Stratz) com preço implícito.
+Divergência > 15% + preço ≤ 40¢ + liquidez > $100 + partida em ≤ 4h → entrada.
+Ligas LoL: LCK, LCS, LEC, LPL, CBLOL. Dota 2 via Stratz GraphQL. Ciclo: 30min.
+
+### B3 — Politics / Elections Oracle
+Detecta inconsistências lógicas entre mercados eleitorais:
+- **Tipo 4a** — soma de candidatos ≠ 1 (UNDERSUM/OVERSUM)
+- **Tipo 4b** — ordenação de datas: P(by earlier) > P(by later)
+- **Tipo 4c** — P(candidato) > P(partido) — impossível matematicamente
+
+Guarda extra: rejeita grupos com critérios de resolução divergentes (popular vote
+vs. electoral college detectado nas regras do mercado).
+Fee ≤ 1% · spread ≥ 2.5% · liquidez > $100 · resolução ≤ 90 dias. Ciclo: 15min.
+
+### B4 — Sports Live-Game Oracle (NBA / NFL / MLB / NHL)
+Detecta violação: P(win by N+ points) > P(win outright) — matematicamente impossível.
+Exemplo: P(Lakers +5) = 62¢ > P(Lakers win) = 55¢ → comprar YES ML + NO spread.
+
+Modo dinâmico:
+- **Standby** (padrão): sem jogos ao vivo → ciclo de 30min.
+- **Ativo**: ao detectar jogo com resolução < 4h → ciclo cai para 60s.
+- **Bloqueio**: sem entrada nos últimos 5 min do jogo.
+
+Fee ≤ 0.75% · spread ≥ 2% · liquidez > $500.
 
 ---
 
@@ -187,15 +217,17 @@ polymarket_bot/
 │   ├── rule_validator.py     # Qualidade de regras (keywords + Claude Haiku)
 │   ├── phase_manager.py      # Controle de fases (A → B)
 │   ├── clob_utils.py         # Utilitários CLOB API + Gamma API
-│   ├── oracle_b1.py          # Fase futura: weather oracle
-│   └── oracle_b2.py          # Fase futura: esports oracle
+│   ├── oracle_b1.py          # Weather oracle
+│   ├── oracle_b2.py          # Esports oracle (LoL + Dota 2)
+│   ├── oracle_b3.py          # Politics / Elections oracle
+│   └── oracle_b4.py          # Sports live-game oracle (NBA/NFL/MLB/NHL)
 ├── data/
 │   ├── logs/                 # Logs diários
 │   ├── trades/
 │   │   ├── signals.csv       # Entradas hipotéticas
 │   │   └── resolved.csv      # Resultados por mercado fechado
 │   └── snapshots/
-├── tests/                    # 142 testes (pytest)
+├── tests/                    # 178 testes (pytest)
 ├── docs/BRIEFING.md
 ├── main.py
 └── simulate.py               # Executa um ciclo único para teste manual
@@ -225,6 +257,7 @@ Open-Meteo (B1, sem chave) · Liquipedia REST (B2, sem chave)
 - [x] main.py (dry-run, logging, loops de scanner/tracker/phase)
 - [x] VPS DigitalOcean configurada e rodando (systemd)
 - [x] Repositório privado GitHub (GLeon10/polymarket-bot)
-- [ ] Validar 1 semana em dry-run → avaliar sinais encontrados
-- [ ] Após $80–100 lucro hipotético confirmado → ativar execução real
-- [ ] Após execução real validada → oracle_b1.py → oracle_b2.py
+- [x] modules/oracle_b3.py (Politics — 3 detectores + filtro de critério de voto)
+- [x] modules/oracle_b4.py (Sports live-game — ML vs spread, modo standby/ativo)
+- [ ] Validar 1 semana em dry-run → avaliar sinais encontrados (A, B1, B2, B3, B4)
+- [ ] Após lucro hipotético confirmado → ativar execução real
