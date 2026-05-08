@@ -130,7 +130,7 @@ def _get_min_liquidity(market: dict) -> float:
 def _filter_candidates(markets: list[dict]) -> list[dict]:
     result = []
     for m in markets:
-        if m.get("taker_base_fee", -1) != 0:
+        if float(m.get("taker_base_fee", 1)) > config.A_MAX_FEE:
             continue
         if not clob_utils.token_by_outcome(m, "Yes") or not clob_utils.token_by_outcome(m, "No"):
             continue
@@ -295,6 +295,22 @@ def _actual_return(gap: float, n: int, oversum: bool) -> float:
     return gap / (1.0 - gap)
 
 
+def _fee_cost(markets: list[dict], prices: list[float], oversum: bool) -> float:
+    """
+    Custo de fee ponderado pelo lado negociado.
+    UNDERSUM: compra YES → ponderado pelos preços YES.
+    OVERSUM:  compra NO  → ponderado pelos preços NO.
+    """
+    side_prices = [1.0 - p for p in prices] if oversum else list(prices)
+    total = sum(side_prices)
+    if total == 0:
+        return 0.0
+    return sum(
+        sp * float(m.get("taker_base_fee", 0))
+        for m, sp in zip(markets, side_prices)
+    ) / total
+
+
 def _detect_type1(candidates: list[dict]) -> list[ArbSignal]:
     signals = []
     for event, group in _group_by_event(candidates).items():
@@ -308,8 +324,10 @@ def _detect_type1(candidates: list[dict]) -> list[ArbSignal]:
         oversum  = total > 1.0
         n        = len(group)
         ret      = _actual_return(gap, n, oversum)
+        fee      = _fee_cost(group, prices, oversum)
+        net_ret  = ret - fee
         min_ret  = config.A_MIN_SPREAD + (n - 1) * config.A_SPREAD_PER_MARKET
-        if ret < min_ret:
+        if net_ret < min_ret:
             continue
         min_liq = min(_get_min_liquidity(m) for m in group)
         if min_liq < config.A_MIN_LIQUIDITY:
@@ -321,7 +339,7 @@ def _detect_type1(candidates: list[dict]) -> list[ArbSignal]:
             1,
             f"Tipo 1 {direction} — '{event}' ({n} candidatos): "
             f"soma YES={total:.2%} → {action}",
-            group, prices, round(ret, 4), min_liq, res_ok, res_notes,
+            group, prices, round(net_ret, 4), min_liq, res_ok, res_notes,
         ))
     return signals
 
@@ -360,8 +378,10 @@ def _detect_ranges(candidates: list[dict]) -> list[ArbSignal]:
         oversum = total > 1.0
         n       = len(group)
         ret     = _actual_return(gap, n, oversum)
+        fee     = _fee_cost(group, prices, oversum)
+        net_ret = ret - fee
         min_ret = config.A_MIN_SPREAD + (n - 1) * config.A_SPREAD_PER_MARKET
-        if ret < min_ret:
+        if net_ret < min_ret:
             continue
         min_liq = min(_get_min_liquidity(m) for m in group)
         if min_liq < config.A_MIN_LIQUIDITY:
@@ -373,7 +393,7 @@ def _detect_ranges(candidates: list[dict]) -> list[ArbSignal]:
             1,
             f"Tipo 1 RANGE {direction} — '{stem[:50]}' ({n} faixas): "
             f"soma YES={total:.2%} → {action}",
-            group, prices, round(ret, 4), min_liq, res_ok, res_notes,
+            group, prices, round(net_ret, 4), min_liq, res_ok, res_notes,
         ))
     return signals
 

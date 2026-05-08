@@ -50,6 +50,7 @@ B1_MIN_RESOLVED_FOR_B2 = int(os.getenv("B1_MIN_RESOLVED_FOR_B2", "5"))  # resolu
 # ── Módulo A — Arbitragem Combinatória ───────────────────────────────────────
 A_MIN_SPREAD          = 0.02   # retorno mínimo base (2%) para trades de 2 mercados
 A_SPREAD_PER_MARKET   = 0.005  # 0.5% adicional por mercado (bid-ask + slippage sequencial)
+A_MAX_FEE             = 0.01   # fee máxima aceita por mercado (1%) — deduzida do retorno
 A_MIN_LIQUIDITY       = 100.0  # $100 mínimo no order book de cada lado
 A_MAX_RESOLUTION_DAYS = 30     # mercados que resolvem em ≤ 30 dias
 A_TRADE_SIZE_USD      = 50.0   # 10% do capital total ($50 com $500)

@@ -181,11 +181,38 @@ def test_type1_pnl_estimate():
     assert abs(sigs[0].pnl_est - expected) < 0.05
 
 
-def test_type1_rejects_nonzero_fee():
+def test_type1_rejects_fee_above_max():
+    # fee=0.02 (2%) > A_MAX_FEE (1%) → mercado excluído dos candidatos
     m = _market("Will Brazil win the World Cup?", 0.40, "br")
-    m["taker_base_fee"] = 100
+    m["taker_base_fee"] = 0.02
     m2 = _market("Will Argentina win the World Cup?", 0.35, "ar")
     sigs = _run_scan([m, m2])
+    assert len(sigs) == 0
+
+
+def test_type1_accepts_low_fee_market():
+    # fee=0.005 (0.5%) ≤ A_MAX_FEE (1%) → aceito, spread = net_ret < gross_ret
+    markets = [
+        _market("Will Brazil win the World Cup?",    0.40, "br"),
+        _market("Will Argentina win the World Cup?", 0.35, "ar"),
+        _market("Will Germany win the World Cup?",   0.18, "de"),
+    ]
+    for m in markets:
+        m["taker_base_fee"] = 0.005
+    sigs = _run_scan(markets)
+    assert len(sigs) == 1
+    assert sigs[0].spread < round(0.07 / 0.93, 4)  # net < gross
+
+
+def test_type1_fee_eliminates_thin_spread():
+    # gap=0.03, n=2, gross_ret≈0.031, fee=0.01 → net≈0.021 < min_ret(0.025) → descartado
+    markets = [
+        _market("Will Brazil win the World Cup?",    0.50, "br"),
+        _market("Will Argentina win the World Cup?", 0.47, "ar"),
+    ]
+    for m in markets:
+        m["taker_base_fee"] = 0.01
+    sigs = _run_scan(markets)
     assert len(sigs) == 0
 
 

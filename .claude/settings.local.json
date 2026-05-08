@@ -12,7 +12,10 @@
       "Bash(.venv\\\\Scripts\\\\python.exe -c \"import dotenv, requests; print\\('OK'\\)\")",
       "Bash(python -m pytest tests/test_scanner_a.py -q)",
       "Bash(.venvScriptspython.exe -c ' *)",
-      "Bash(Remove-Item \"c:\\\\Users\\\\User01\\\\Documents\\\\prime-aura-trading\\\\polymarket_bot\\\\fetch_example.py\")"
+      "Bash(Remove-Item \"c:\\\\Users\\\\User01\\\\Documents\\\\prime-aura-trading\\\\polymarket_bot\\\\fetch_example.py\")",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
     ]
   }
 }
