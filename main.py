@@ -30,6 +30,13 @@ def _setup_logging():
         ],
     )
 
+    # Logs individuais por módulo (escrita paralela ao log unificado)
+    module_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    for module_name in ("scanner_a", "scanner_corr", "oracle_b1", "oracle_b2", "oracle_b3", "oracle_b4"):
+        fh = logging.FileHandler(log_dir / f"{module_name}.log", encoding="utf-8")
+        fh.setFormatter(module_fmt)
+        logging.getLogger(module_name).addHandler(fh)
+
 logger = logging.getLogger("main")
 
 # ── Loop de cada módulo ───────────────────────────────────────────────────────

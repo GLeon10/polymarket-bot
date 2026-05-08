@@ -20,7 +20,7 @@ def test_city_detected_case_insensitive():
     assert _city_from_question("Will SEOUL temperature exceed 35?") == "Seoul"
 
 def test_city_not_detected():
-    assert _city_from_question("Will it rain in Paris?") is None
+    assert _city_from_question("Will it rain in Buenos Aires?") is None
 
 def test_city_detected_hong_kong():
     assert _city_from_question("Hong Kong high above 33C on May 8?") == "Hong Kong"

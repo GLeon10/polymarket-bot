@@ -76,16 +76,26 @@ B1_TARGET_TAGS       = {"Weather", "Daily Temperature", "Highest temperature", "
 
 B1_CITIES = {
     "New York":  {"lat": 40.7128,  "lon": -74.0060},
-    "London":    {"lat": 51.5074,  "lon": -0.1278},
+    "London":    {"lat": 51.5074,  "lon":  -0.1278},
     "Seoul":     {"lat": 37.5665,  "lon": 126.9780},
     "Hong Kong": {"lat": 22.3193,  "lon": 114.1694},
-    "Madrid":    {"lat": 40.4168,  "lon": -3.7038},
+    "Madrid":    {"lat": 40.4168,  "lon":  -3.7038},
+    "Tokyo":     {"lat": 35.6762,  "lon": 139.6503},
+    "Sydney":    {"lat": -33.8688, "lon": 151.2093},
+    "São Paulo": {"lat": -23.5505, "lon": -46.6333},
+    "Mumbai":    {"lat": 19.0760,  "lon":  72.8777},
+    "Berlin":    {"lat": 52.5200,  "lon":  13.4050},
+    "Cairo":     {"lat": 30.0444,  "lon":  31.2357},
+    "Singapore": {"lat":  1.3521,  "lon": 103.8198},
+    "Paris":     {"lat": 48.8566,  "lon":   2.3522},
+    "Toronto":   {"lat": 43.6532,  "lon": -79.3832},
+    "Dubai":     {"lat": 25.2048,  "lon":  55.2708},
 }
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 # ── Módulo B2 — Esports Oracle ───────────────────────────────────────────────
-B2_MIN_DIVERGENCE    = 0.15   # 15% divergência win-rate vs. mercado
+B2_MIN_DIVERGENCE    = 0.10   # 10% divergência win-rate vs. mercado (era 15%, reduzido para coleta de dados)
 B2_MAX_SHARE_PRICE   = 0.40
 B2_MIN_LIQUIDITY     = 100.0
 B2_MAX_RESOLUTION_H  = 4      # partidas que resolvem em ≤ 4h
