@@ -1,0 +1,174 @@
+"""
+Orquestrador principal — roda os 3 módulos em paralelo com seus intervalos.
+"""
+
+import logging
+import sys
+import threading
+import time
+from pathlib import Path
+
+from config import config
+from modules import scanner_a, oracle_b1, oracle_b2, scanner_corr, tracker, phase_manager
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+def _setup_logging():
+    log_dir = Path(__file__).parent / "data" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    from datetime import datetime
+    log_file = log_dir / f"{datetime.utcnow().strftime('%Y-%m-%d')}.log"
+
+    fmt = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+    logging.basicConfig(
+        level=logging.INFO,
+        format=fmt,
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+logger = logging.getLogger("main")
+
+# ── Loop de cada módulo ───────────────────────────────────────────────────────
+
+def _run_loop(name: str, interval: int, scan_fn, execute_fn, client):
+    """Roda scan_fn a cada `interval` segundos em thread própria."""
+    logger.info("Módulo %s iniciado (intervalo=%ds mode=%s)", name, interval, config.MODE)
+    while True:
+        try:
+            # Módulos B só rodam quando a fase 2 estiver ativa
+            if name == "B1" and not phase_manager.is_b1_runnable():
+                time.sleep(interval)
+                continue
+            if name == "B2" and not phase_manager.is_b2_runnable():
+                time.sleep(interval)
+                continue
+
+            signals = scan_fn()
+            for signal in signals:
+                execute_fn(signal, client)
+        except Exception as e:
+            logger.exception("Erro inesperado no módulo %s: %s", name, e)
+        time.sleep(interval)
+
+
+def _phase_loop():
+    """Verifica condições de fase a cada 10 minutos."""
+    logger.info("Phase manager iniciado (intervalo=10min)")
+    while True:
+        try:
+            phase_manager.check_and_update()
+        except Exception as e:
+            logger.exception("Erro no phase_manager: %s", e)
+        time.sleep(600)
+
+
+def _tracker_loop():
+    """Verifica resoluções e imprime resumo a cada 6 horas."""
+    logger.info("Tracker iniciado (intervalo=6h)")
+    while True:
+        try:
+            tracker.check_resolutions()
+            tracker.print_summary()
+        except Exception as e:
+            logger.exception("Erro inesperado no tracker: %s", e)
+        time.sleep(6 * 3600)
+
+
+def _build_client():
+    """
+    Inicializa o cliente CLOB do Polymarket.
+    Em dry_run retorna None (não precisa de autenticação).
+    """
+    if config.MODE == "dry_run":
+        return None
+
+    from py_clob_client.client import ClobClient
+    from py_clob_client.constants import POLYGON
+
+    client = ClobClient(
+        host        = config.CLOB_BASE_URL,
+        key         = config.PRIVATE_KEY,
+        chain_id    = POLYGON,
+        signature_type = 1,  # EIP712
+    )
+
+    # Gera/atualiza API key L2 se não estiver no .env
+    if not config.POLY_API_KEY:
+        logger.info("Gerando nova API key L2 para a wallet %s…", config.WALLET_ADDRESS)
+        api_creds = client.create_or_derive_api_creds()
+        logger.info(
+            "API key gerada — adicione ao .env:\n  POLY_API_KEY=%s\n  POLY_API_SECRET=%s\n  POLY_API_PASSPHRASE=%s",
+            api_creds.api_key, api_creds.api_secret, api_creds.api_passphrase,
+        )
+    else:
+        from py_clob_client.clob_types import ApiCreds
+        client.set_api_creds(ApiCreds(
+            api_key        = config.POLY_API_KEY,
+            api_secret     = config.POLY_API_SECRET,
+            api_passphrase = config.POLY_API_PASSPHRASE,
+        ))
+
+    return client
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    _setup_logging()
+    config.validate()
+
+    logger.info("=" * 60)
+    logger.info("Polymarket Bot iniciando | modo=%s | capital=$%.0f", config.MODE, config.TOTAL_CAPITAL)
+    logger.info("  A=$%.0f  B1=$%.0f  B2=$%.0f  Reserva=$%.0f",
+                config.CAPITAL_A, config.CAPITAL_B1, config.CAPITAL_B2, config.CAPITAL_RSRV)
+    logger.info("=" * 60)
+
+    client = _build_client()
+
+    strategy_map = [
+        ("A",    config.STRATEGY_A_ENABLED,  config.A_SCAN_INTERVAL,
+         scanner_a.scan,    scanner_a.execute,    config.CAPITAL_A),
+        ("B1",   config.STRATEGY_B1_ENABLED, config.B1_SCAN_INTERVAL,
+         oracle_b1.scan,    oracle_b1.execute,    config.CAPITAL_B1),
+        ("B2",   config.STRATEGY_B2_ENABLED, config.B2_SCAN_INTERVAL,
+         oracle_b2.scan,    oracle_b2.execute,    config.CAPITAL_B2),
+        ("CORR", config.STRATEGY_A_ENABLED,  config.CORR_SCAN_INTERVAL,
+         scanner_corr.scan, scanner_corr.execute, 0.0),
+    ]
+
+    active = []
+    for name, enabled, interval, scan_fn, execute_fn, capital in strategy_map:
+        if enabled:
+            active.append(name)
+            t = threading.Thread(
+                target=_run_loop,
+                args=(name, interval, scan_fn, execute_fn, client),
+                daemon=True, name=f"thread-{name}",
+            )
+            t.start()
+        else:
+            logger.info("Estratégia %s DESATIVADA (STRATEGY_%s_ENABLED=false)", name, name)
+
+    t_phase = threading.Thread(target=_phase_loop, daemon=True, name="thread-phase")
+    t_phase.start()
+
+    t_tracker = threading.Thread(target=_tracker_loop, daemon=True, name="thread-tracker")
+    t_tracker.start()
+
+    state = phase_manager.get_state()
+    logger.info("Fase atual: %d | Estratégia A sempre ativa | B ativa na Fase 2 (gatilho: $%.0f P&L em A)",
+                state["phase"], config.PHASE2_TRIGGER_USD)
+    logger.info("Módulos em execução: %s | Pressione Ctrl+C para encerrar.", ", ".join(active))
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("Encerramento solicitado. Até logo.")
+
+
+if __name__ == "__main__":
+    main()

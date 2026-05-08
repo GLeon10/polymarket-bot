@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(cd \"c:\\\\Users\\\\User01\\\\Documents\\\\prime-aura-trading\\\\polymarket_bot\"; $proc = Start-Process -FilePath \".venv\\\\Scripts\\\\python.exe\" -ArgumentList \"main.py\" -PassThru -NoNewWindow -RedirectStandardOutput \"data\\\\logs\\\\test_run.log\" -RedirectStandardError \"data\\\\logs\\\\test_run_err.log\"; Start-Sleep -Seconds 30; Stop-Process -Id $proc.Id -Force; Get-Content \"data\\\\logs\\\\test_run.log\"; Write-Host \"---STDERR---\"; Get-Content \"data\\\\logs\\\\test_run_err.log\")",
+      "PowerShell(cd \"c:\\\\Users\\\\User01\\\\Documents\\\\prime-aura-trading\\\\polymarket_bot\"; $proc = Start-Process -FilePath \".venv\\\\Scripts\\\\python.exe\" -ArgumentList \"main.py\" -PassThru -NoNewWindow -RedirectStandardOutput \"data\\\\logs\\\\test_run2.log\" -RedirectStandardError \"data\\\\logs\\\\test_run2_err.log\"; Start-Sleep -Seconds 60; Stop-Process -Id $proc.Id -Force; Get-Content \"data\\\\logs\\\\test_run2.log\"; if \\(\\(Get-Content \"data\\\\logs\\\\test_run2_err.log\"\\) -ne $null\\) { Write-Host \"---STDERR---\"; Get-Content \"data\\\\logs\\\\test_run2_err.log\" })",
+      "PowerShell(cd \"c:\\\\Users\\\\User01\\\\Documents\\\\prime-aura-trading\\\\polymarket_bot\"; .venv\\\\Scripts\\\\python.exe -c \"from config import config; config.validate\\(\\); print\\(f'OK | A={config.STRATEGY_A_ENABLED} B1={config.STRATEGY_B1_ENABLED} B2={config.STRATEGY_B2_ENABLED} | Alloc: A={config.ALLOC_A:.0%} B1={config.ALLOC_B1:.0%} B2={config.ALLOC_B2:.0%} Rsrv={config.ALLOC_RSRV:.0%} | Capital: A=${config.CAPITAL_A:.0f} B1=${config.CAPITAL_B1:.0f} B2=${config.CAPITAL_B2:.0f}'\\)\")",
+      "PowerShell(cd \"c:\\\\Users\\\\User01\\\\Documents\\\\prime-aura-trading\\\\polymarket_bot\"; $proc = Start-Process -FilePath \".venv\\\\Scripts\\\\python.exe\" -ArgumentList \"main.py\" -PassThru -NoNewWindow -RedirectStandardOutput \"data\\\\logs\\\\test_run3.log\" -RedirectStandardError \"data\\\\logs\\\\test_run3_err.log\"; Start-Sleep -Seconds 60; Stop-Process -Id $proc.Id -Force; Get-Content \"data\\\\logs\\\\test_run3.log\"; if \\(\\(Get-Item \"data\\\\logs\\\\test_run3_err.log\"\\).Length -gt 0\\) { Write-Host \"---STDERR---\"; Get-Content \"data\\\\logs\\\\test_run3_err.log\" })",
+      "Bash(.venv\\\\Scripts\\\\python.exe -m pytest tests/ -q)",
+      "PowerShell(Get-Process | Where-Object { $_.Name -match \"python|excel|EXCEL\" } | Select-Object Name, Id)",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(pip install *)",
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import dotenv, requests; print\\('OK'\\)\")",
+      "Bash(python -m pytest tests/test_scanner_a.py -q)",
+      "Bash(.venvScriptspython.exe -c ' *)",
+      "Bash(Remove-Item \"c:\\\\Users\\\\User01\\\\Documents\\\\prime-aura-trading\\\\polymarket_bot\\\\fetch_example.py\")"
+    ]
+  }
+}
