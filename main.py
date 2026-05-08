@@ -39,10 +39,7 @@ def _run_loop(name: str, interval: int, scan_fn, execute_fn, client):
     logger.info("Módulo %s iniciado (intervalo=%ds mode=%s)", name, interval, config.MODE)
     while True:
         try:
-            # Módulos B só rodam quando a fase 2 estiver ativa
-            if name == "B1" and not phase_manager.is_b1_runnable():
-                time.sleep(interval)
-                continue
+            # B2 só roda quando a fase 2 estiver ativa
             if name == "B2" and not phase_manager.is_b2_runnable():
                 time.sleep(interval)
                 continue
@@ -160,7 +157,7 @@ def main():
     t_tracker.start()
 
     state = phase_manager.get_state()
-    logger.info("Fase atual: %d | Estratégia A sempre ativa | B ativa na Fase 2 (gatilho: $%.0f P&L em A)",
+    logger.info("Fase atual: %d | A e B1 sempre ativas | B2 ativa na Fase 2 (gatilho: $%.0f P&L em A)",
                 state["phase"], config.PHASE2_TRIGGER_USD)
     logger.info("Módulos em execução: %s | Pressione Ctrl+C para encerrar.", ", ".join(active))
     try:
