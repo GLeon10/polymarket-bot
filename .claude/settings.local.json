@@ -15,7 +15,9 @@
       "Bash(Remove-Item \"c:\\\\Users\\\\User01\\\\Documents\\\\prime-aura-trading\\\\polymarket_bot\\\\fetch_example.py\")",
       "Bash(git add *)",
       "Bash(git commit *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(python -m pytest tests/test_oracle_b3.py tests/test_oracle_b4.py -v)",
+      "Bash(python -m pytest --tb=short -q)"
     ]
   }
 }
