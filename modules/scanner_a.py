@@ -629,8 +629,8 @@ def scan() -> list[ArbSignal]:
     all_markets = clob_utils.fetch_sampling_markets()
     candidates  = _filter_candidates(all_markets)
     logger.info(
-        "Scanner A: %d mercados totais → %d candidatos (fee=0, preco valido, <=%dd)",
-        len(all_markets), len(candidates), config.A_MAX_RESOLUTION_DAYS,
+        "Scanner A: %d mercados totais → %d candidatos (fee≤%.0f%%, preco valido, <=%dd)",
+        len(all_markets), len(candidates), config.A_MAX_FEE * 100, config.A_MAX_RESOLUTION_DAYS,
     )
 
     all_signals: list[ArbSignal] = []
