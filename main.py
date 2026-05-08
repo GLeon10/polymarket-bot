@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from config import config
-from modules import scanner_a, oracle_b1, oracle_b2, scanner_corr, tracker, phase_manager
+from modules import scanner_a, oracle_b1, oracle_b2, oracle_b3, oracle_b4, scanner_corr, tracker, phase_manager
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -45,6 +45,21 @@ def _run_loop(name: str, interval: int, scan_fn, execute_fn, client):
                 execute_fn(signal, client)
         except Exception as e:
             logger.exception("Erro inesperado no módulo %s: %s", name, e)
+        time.sleep(interval)
+
+
+def _run_b4_loop():
+    """Loop B4 com intervalo dinâmico: standby=30min, ativo=60s."""
+    logger.info("Módulo B4 iniciado (standby=%ds, ativo=%ds, mode=%s)",
+                config.B4_STANDBY_INTERVAL, config.B4_ACTIVE_INTERVAL, config.MODE)
+    while True:
+        try:
+            signals = oracle_b4.scan()
+            for signal in signals:
+                oracle_b4.execute(signal, None)
+        except Exception as e:
+            logger.exception("Erro inesperado no módulo B4: %s", e)
+        interval = config.B4_ACTIVE_INTERVAL if oracle_b4.is_active() else config.B4_STANDBY_INTERVAL
         time.sleep(interval)
 
 
@@ -129,6 +144,8 @@ def main():
          oracle_b1.scan,    oracle_b1.execute,    config.CAPITAL_B1),
         ("B2",   config.STRATEGY_B2_ENABLED, config.B2_SCAN_INTERVAL,
          oracle_b2.scan,    oracle_b2.execute,    config.CAPITAL_B2),
+        ("B3",   config.STRATEGY_B3_ENABLED, config.B3_SCAN_INTERVAL,
+         oracle_b3.scan,    oracle_b3.execute,    0.0),
         ("CORR", config.STRATEGY_A_ENABLED,  config.CORR_SCAN_INTERVAL,
          scanner_corr.scan, scanner_corr.execute, 0.0),
     ]
@@ -145,6 +162,13 @@ def main():
             t.start()
         else:
             logger.info("Estratégia %s DESATIVADA (STRATEGY_%s_ENABLED=false)", name, name)
+
+    if config.STRATEGY_B4_ENABLED:
+        active.append("B4")
+        t_b4 = threading.Thread(target=_run_b4_loop, daemon=True, name="thread-B4")
+        t_b4.start()
+    else:
+        logger.info("Estratégia B4 DESATIVADA (STRATEGY_B4_ENABLED=false)")
 
     t_phase = threading.Thread(target=_phase_loop, daemon=True, name="thread-phase")
     t_phase.start()

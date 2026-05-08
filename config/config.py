@@ -17,6 +17,8 @@ MODE: str = os.getenv("MODE", "dry_run")  # "dry_run" | "live"
 STRATEGY_A_ENABLED:  bool = os.getenv("STRATEGY_A_ENABLED",  "true").lower() == "true"
 STRATEGY_B1_ENABLED: bool = os.getenv("STRATEGY_B1_ENABLED", "true").lower() == "true"
 STRATEGY_B2_ENABLED: bool = os.getenv("STRATEGY_B2_ENABLED", "true").lower() == "true"
+STRATEGY_B3_ENABLED: bool = os.getenv("STRATEGY_B3_ENABLED", "true").lower() == "true"
+STRATEGY_B4_ENABLED: bool = os.getenv("STRATEGY_B4_ENABLED", "true").lower() == "true"
 
 # ── Polymarket API ───────────────────────────────────────────────────────────
 CLOB_BASE_URL = "https://clob.polymarket.com"
@@ -115,6 +117,33 @@ ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 # ── Telegram (notificações de sinais) ─────────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID:   str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ── Módulo B3 — Politics / Elections Oracle ──────────────────────────────────
+B3_TARGET_TAGS = {
+    "Politics", "Elections", "US Elections", "US Politics",
+    "Global Politics", "2024 Elections", "2026 Elections",
+}
+B3_MAX_FEE             = 0.01
+B3_MIN_SPREAD          = 0.025
+B3_MIN_LIQUIDITY       = 100.0
+B3_MAX_RESOLUTION_DAYS = 90
+B3_SCAN_INTERVAL       = 900   # segundos (15 min)
+B3_TRADE_SIZE_USD      = 50.0
+
+# ── Módulo B4 — Sports Live-Game Oracle ──────────────────────────────────────
+B4_LEAGUES = ["NBA", "NFL", "MLB", "NHL"]
+B4_TARGET_TAGS = {
+    "NBA", "NFL", "MLB", "NHL",
+    "Basketball", "American Football", "Baseball", "Hockey",
+}
+B4_MAX_FEE           = 0.0075
+B4_MIN_SPREAD        = 0.020
+B4_MIN_LIQUIDITY     = 500.0
+B4_STANDBY_INTERVAL  = 1800  # segundos (30 min)
+B4_ACTIVE_INTERVAL   = 60    # segundos (1 min) quando há jogos ao vivo
+B4_LIVE_WINDOW_H     = 4     # jogo resolve em ≤ 4h
+B4_BLOCK_FINAL_MIN   = 5     # bloqueia nos últimos 5 min do jogo
+B4_TRADE_SIZE_USD    = 50.0
 
 # Cache de win-rate: quantas horas reutilizar antes de buscar novamente
 B2_WINRATE_CACHE_H = int(os.getenv("B2_WINRATE_CACHE_H", "6"))
