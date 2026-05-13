@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from config import config
-from modules import scanner_a, oracle_b1, oracle_b2, oracle_b3, oracle_b4, scanner_corr, tracker, phase_manager
+from modules import scanner_a, oracle_b1, oracle_b2, oracle_b3, oracle_b4, oracle_b5, scanner_corr, tracker, phase_manager
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ def _setup_logging():
 
     # Logs individuais por módulo (escrita paralela ao log unificado)
     module_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    for module_name in ("scanner_a", "scanner_corr", "oracle_b1", "oracle_b2", "oracle_b3", "oracle_b4"):
+    for module_name in ("scanner_a", "scanner_corr", "oracle_b1", "oracle_b2", "oracle_b3", "oracle_b4", "oracle_b5"):
         fh = logging.FileHandler(log_dir / f"{module_name}.log", encoding="utf-8")
         fh.setFormatter(module_fmt)
         logging.getLogger(module_name).addHandler(fh)
@@ -68,6 +68,20 @@ def _run_b4_loop():
             logger.exception("Erro inesperado no módulo B4: %s", e)
         interval = config.B4_ACTIVE_INTERVAL if oracle_b4.is_active() else config.B4_STANDBY_INTERVAL
         time.sleep(interval)
+
+
+def _run_b5_loop(client):
+    """Loop B5: scan a cada B5_SCAN_INTERVAL segundos."""
+    logger.info("Módulo B5 iniciado (intervalo=%ds mode=%s)",
+                config.B5_SCAN_INTERVAL, config.MODE)
+    while True:
+        try:
+            signals = oracle_b5.scan()
+            for signal in signals:
+                oracle_b5.execute(signal, client)
+        except Exception as e:
+            logger.exception("Erro inesperado no módulo B5: %s", e)
+        time.sleep(config.B5_SCAN_INTERVAL)
 
 
 def _phase_loop():
@@ -176,6 +190,13 @@ def main():
         t_b4.start()
     else:
         logger.info("Estratégia B4 DESATIVADA (STRATEGY_B4_ENABLED=false)")
+
+    if config.STRATEGY_B5_ENABLED:
+        active.append("B5")
+        t_b5 = threading.Thread(target=_run_b5_loop, args=(client,), daemon=True, name="thread-B5")
+        t_b5.start()
+    else:
+        logger.info("Estratégia B5 DESATIVADA (STRATEGY_B5_ENABLED=false)")
 
     t_phase = threading.Thread(target=_phase_loop, daemon=True, name="thread-phase")
     t_phase.start()

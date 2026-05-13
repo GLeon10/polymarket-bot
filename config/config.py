@@ -160,6 +160,17 @@ B2_WINRATE_CACHE_H = int(os.getenv("B2_WINRATE_CACHE_H", "6"))
 # Mínimo de partidas para considerar win-rate confiável
 B2_MIN_MATCHES     = int(os.getenv("B2_MIN_MATCHES", "5"))
 
+# ── Módulo B5 — Crypto 5-Min Spread Capture ──────────────────────────────────
+STRATEGY_B5_ENABLED: bool = os.getenv("STRATEGY_B5_ENABLED", "true").lower() == "true"
+B5_ASSETS         = ["BTC", "ETH", "SOL"]
+B5_TRADE_SIZE_USD = 25.0      # por lado ($50 total)
+B5_THRESHOLD      = 0.982     # p_up + p_down + fee_total < B5_THRESHOLD
+B5_FEE_RATE       = 0.072     # taker fee crypto Polymarket: fee = rate × p × (1−p)
+B5_T_ENTRY_MIN_S  = 30        # segundos após abertura do candle: início da janela
+B5_T_ENTRY_MAX_S  = 240       # segundos após abertura do candle: fim da janela
+B5_CANDLE_SECS    = 300       # duração do candle (5 minutos)
+B5_SCAN_INTERVAL  = 60        # segundos (1 min)
+
 # ── Risco ────────────────────────────────────────────────────────────────────
 B_MONTHLY_STOP_LOSS = -0.10   # -10% do capital alocado em B → pausar B
 

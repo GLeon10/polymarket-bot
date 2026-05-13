@@ -34,6 +34,11 @@ from modules.oracle_b4 import (
 from modules import rule_validator
 from modules.rule_validator import _keyword_quality
 from modules import scanner_corr as _scanner_corr_mod
+import modules.oracle_b5 as oracle_b5_mod
+from modules.oracle_b5 import (
+    _fee, _total_cost, _in_entry_window, _is_5min_crypto, _detect_asset,
+    CryptoSpreadSignal,
+)
 from modules.scanner_corr import (
     CorrSignal, _filter_fee, _filter_liquidity,
     _filter_exhaustiveness, _filter_resolution,
@@ -1445,3 +1450,205 @@ class TestOracleB4:
              patch("modules.oracle_b4.clob_utils.get_orderbook_liquidity", return_value=600.0):
             _b4_scan()
         assert oracle_b4_mod.is_active() is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# oracle_b5
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOracleB5:
+
+    # ── Fórmulas ──────────────────────────────────────────────────────────────
+
+    def test_fee_at_midpoint(self):
+        # fee(0.5) = 0.072 × 0.5 × 0.5 = 0.018
+        assert abs(_fee(0.5) - 0.018) < 1e-9
+
+    def test_fee_at_low_price(self):
+        # fee(0.1) = 0.072 × 0.1 × 0.9 = 0.00648
+        assert abs(_fee(0.1) - 0.00648) < 1e-9
+
+    def test_fee_zero_at_extremes(self):
+        assert _fee(0.0) == 0.0
+        assert _fee(1.0) == 0.0
+
+    def test_total_cost_above_threshold(self):
+        # p_up=p_down=0.50: cost = 1.0 + 0.036 = 1.036 → above 0.982
+        assert _total_cost(0.50, 0.50) > 0.982
+
+    def test_total_cost_below_threshold(self):
+        # p_up=p_down=0.44: cost ≈ 0.88 + 0.034 = 0.914 → below 0.982
+        assert _total_cost(0.44, 0.44) < 0.982
+
+    def test_total_cost_symmetric(self):
+        assert abs(_total_cost(0.4, 0.5) - _total_cost(0.5, 0.4)) < 1e-12
+
+    # ── Janela de entrada ─────────────────────────────────────────────────────
+
+    def test_in_window_at_60s(self):
+        end = datetime.now(timezone.utc) + timedelta(seconds=300 - 60)
+        assert _in_entry_window(end) is True
+
+    def test_not_in_window_too_early(self):
+        # apenas 10s após abertura → ainda não entrou na janela
+        end = datetime.now(timezone.utc) + timedelta(seconds=300 - 10)
+        assert _in_entry_window(end) is False
+
+    def test_not_in_window_too_late(self):
+        # 280s após abertura → passou o T+240s
+        end = datetime.now(timezone.utc) + timedelta(seconds=300 - 280)
+        assert _in_entry_window(end) is False
+
+    def test_in_window_at_boundary_min(self):
+        # exatamente T+30s
+        end = datetime.now(timezone.utc) + timedelta(seconds=300 - 30)
+        assert _in_entry_window(end) is True
+
+    def test_in_window_at_boundary_max(self):
+        # exatamente T+240s
+        end = datetime.now(timezone.utc) + timedelta(seconds=300 - 240)
+        assert _in_entry_window(end) is True
+
+    # ── Detecção de mercados ──────────────────────────────────────────────────
+
+    def test_detects_btc_5min(self):
+        assert _is_5min_crypto({"question": "Will BTC be above $100k in the next 5 minute?"})
+
+    def test_detects_eth_5min(self):
+        assert _is_5min_crypto({"question": "Will ETH reach $3000 in 5-min?"})
+
+    def test_detects_sol_5min(self):
+        assert _is_5min_crypto({"question": "Will Solana hit $200 in 5 min?"})
+
+    def test_rejects_non_5min_crypto(self):
+        assert not _is_5min_crypto({"question": "Will BTC reach $100k by 2025?"})
+
+    def test_rejects_non_crypto_5min(self):
+        assert not _is_5min_crypto({"question": "Will stocks rise in 5 minutes?"})
+
+    def test_rejects_empty_question(self):
+        assert not _is_5min_crypto({"question": ""})
+
+    # ── Detecção de asset ─────────────────────────────────────────────────────
+
+    def test_detect_btc(self):
+        assert _detect_asset("Will BTC be above $90k in 5 min?") == "BTC"
+
+    def test_detect_bitcoin(self):
+        assert _detect_asset("Will Bitcoin hit $100k in the next 5 minute?") == "BTC"
+
+    def test_detect_eth(self):
+        assert _detect_asset("ETH 5-min candle above $3000?") == "ETH"
+
+    def test_detect_sol(self):
+        assert _detect_asset("Will SOL price exceed $180 in 5 min?") == "SOL"
+
+    def test_detect_unknown_returns_crypto(self):
+        assert _detect_asset("Will some token 5-min go up?") == "CRYPTO"
+
+    # ── scan() ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _gamma_market(cid="0xB5A1", question="Will BTC be above $90k in 5 min?",
+                      yes_price=0.44, seconds_to_end=180):
+        end = (datetime.now(timezone.utc) + timedelta(seconds=seconds_to_end)).isoformat()
+        return {
+            "condition_id": cid, "question": question,
+            "end_date_iso": end, "market_slug": f"slug-{cid}",
+            "tokens": [
+                {"outcome": "Yes", "token_id": f"yes-{cid}", "price": str(yes_price)},
+                {"outcome": "No",  "token_id": f"no-{cid}",  "price": str(1 - yes_price)},
+            ],
+        }
+
+    def _run_scan(self, markets, yes_ask=0.44, no_ask=0.44):
+        oracle_b5_mod._watched.clear()
+        for m in markets:
+            oracle_b5_mod._executed.discard(m.get("condition_id", ""))
+        with patch("modules.oracle_b5._find_markets", return_value=markets), \
+             patch("modules.oracle_b5._start_ws"), \
+             patch("modules.oracle_b5._get_ask", side_effect=lambda tid: yes_ask if "yes" in tid else no_ask), \
+             patch("modules.oracle_b5._rest_ask", return_value=0.0):
+            return oracle_b5_mod.scan()
+
+    def test_scan_returns_signal_below_threshold(self):
+        # p_up=p_down=0.44 → cost ≈ 0.914 < 0.982
+        m = self._gamma_market(seconds_to_end=180)  # T+120s elapsed → in window
+        sigs = self._run_scan([m])
+        assert len(sigs) == 1
+        assert sigs[0].asset == "BTC"
+        assert sigs[0].spread > 0
+
+    def test_scan_no_signal_above_threshold(self):
+        # p_up=p_down=0.50 → cost = 1.036 > 0.982
+        m = self._gamma_market(seconds_to_end=180)
+        sigs = self._run_scan([m], yes_ask=0.50, no_ask=0.50)
+        assert sigs == []
+
+    def test_scan_no_signal_outside_entry_window(self):
+        # seconds_to_end=295 → apenas 5s elapsed → too early
+        m = self._gamma_market(seconds_to_end=295)
+        sigs = self._run_scan([m])
+        assert sigs == []
+
+    def test_scan_deduplicates_executed_markets(self):
+        m = self._gamma_market(cid="0xDUP1", seconds_to_end=180)
+        oracle_b5_mod._watched.clear()
+        oracle_b5_mod._executed.add("0xDUP1")
+        try:
+            with patch("modules.oracle_b5._find_markets", return_value=[m]), \
+                 patch("modules.oracle_b5._start_ws"), \
+                 patch("modules.oracle_b5._get_ask", return_value=0.44), \
+                 patch("modules.oracle_b5._rest_ask", return_value=0.0):
+                sigs = oracle_b5_mod.scan()
+        finally:
+            oracle_b5_mod._executed.discard("0xDUP1")
+        assert sigs == []
+
+    def test_scan_signal_has_correct_fields(self):
+        m = self._gamma_market(cid="0xFLD1", seconds_to_end=180)
+        sigs = self._run_scan([m], yes_ask=0.44, no_ask=0.44)
+        assert len(sigs) == 1
+        s = sigs[0]
+        assert s.market_id == "0xFLD1"
+        assert s.p_up_ask == pytest.approx(0.44, abs=1e-4)
+        assert s.p_down_ask == pytest.approx(0.44, abs=1e-4)
+        assert s.fee_total == pytest.approx(round(_fee(0.44) * 2, 4), abs=1e-9)
+        assert s.size_usd == 25.0
+
+    # ── execute() ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _sig(cid="0xB5EX"):
+        end = datetime.now(timezone.utc) + timedelta(seconds=120)
+        return CryptoSpreadSignal(
+            market_id="0xB5EX", question="Will BTC 5-min go up?",
+            asset="BTC", p_up_ask=0.44, p_down_ask=0.44,
+            fee_total=round(_fee(0.44) * 2, 6),
+            spread=round(1.0 - _total_cost(0.44, 0.44), 4),
+            size_usd=25.0, end_time=end, slug="btc-5min",
+        )
+
+    def test_execute_dry_run_returns_true(self):
+        oracle_b5_mod._executed.discard("0xB5EX")
+        with patch("modules.oracle_b5.tracker.record_signal"):
+            assert oracle_b5_mod.execute(self._sig(), client=None) is True
+
+    def test_execute_records_signal(self):
+        oracle_b5_mod._executed.discard("0xB5EX")
+        recorded = {}
+        with patch("modules.oracle_b5.tracker.record_signal",
+                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
+            oracle_b5_mod.execute(self._sig(), client=None)
+        assert recorded["args"][0] == "B5"
+        assert recorded["args"][3] == "Yes+No"
+        assert recorded["kwargs"]["n_markets"] == 2
+
+    def test_execute_deduplicates(self):
+        oracle_b5_mod._executed.discard("0xB5EX")
+        calls = []
+        with patch("modules.oracle_b5.tracker.record_signal", side_effect=lambda *a, **kw: calls.append(1)):
+            oracle_b5_mod.execute(self._sig(), client=None)
+            oracle_b5_mod.execute(self._sig(), client=None)   # segunda chamada
+        oracle_b5_mod._executed.discard("0xB5EX")
+        assert len(calls) == 1

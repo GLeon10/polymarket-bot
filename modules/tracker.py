@@ -70,6 +70,8 @@ def _trade_size(module: str) -> float:
         return min(config.A_TRADE_SIZE_USD, config.CAPITAL_A * 0.10)
     if module == "CORR":
         return config.A_TRADE_SIZE_USD   # arbitragem pura, mesmo porte que A
+    if module == "B5":
+        return config.B5_TRADE_SIZE_USD * 2  # $25/lado × 2 = $50 total
     if module == "B3":
         return config.B3_TRADE_SIZE_USD
     if module == "B4":
