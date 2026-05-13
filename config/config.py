@@ -52,9 +52,9 @@ B1_MIN_RESOLVED_FOR_B2 = int(os.getenv("B1_MIN_RESOLVED_FOR_B2", "5"))  # resolu
 # ── Módulo A — Arbitragem Combinatória ───────────────────────────────────────
 A_MIN_SPREAD          = 0.02   # retorno mínimo base (2%) para trades de 2 mercados
 A_SPREAD_PER_MARKET   = 0.005  # 0.5% adicional por mercado (bid-ask + slippage sequencial)
-A_MAX_FEE             = 0.01   # fee máxima aceita por mercado (1%) — deduzida do retorno
+A_MAX_FEE             = 0.025  # fee máxima aceita por mercado (2.5%) — padrão Polymarket é 2%
 A_MIN_LIQUIDITY       = 100.0  # $100 mínimo no order book de cada lado
-A_MAX_RESOLUTION_DAYS = 30     # mercados que resolvem em ≤ 30 dias
+A_MAX_RESOLUTION_DAYS = 60     # mercados que resolvem em ≤ 60 dias
 A_TRADE_SIZE_USD      = 50.0   # 10% do capital total ($50 com $500)
 A_SCAN_INTERVAL       = 600    # segundos (10 min)
 
@@ -67,7 +67,7 @@ CORR_MIN_LIQUIDITY   = 100.0
 A_TARGET_TAGS        = {"Geopolitics", "World"}
 
 # ── Módulo B1 — Weather Oracle ───────────────────────────────────────────────
-B1_MIN_DIVERGENCE    = 0.20   # 20% divergência modelo vs. mercado
+B1_MIN_DIVERGENCE    = 0.12   # 12% divergência modelo vs. mercado
 B1_MAX_SHARE_PRICE   = 0.40   # ≤ 40¢ para reduzir fee efetiva
 B1_MIN_LIQUIDITY     = 100.0
 B1_MAX_RESOLUTION_H  = 24     # apenas mercados que resolvem em ≤ 24h
@@ -148,7 +148,7 @@ B4_TARGET_TAGS = {
 }
 B4_MAX_FEE           = 0.0075
 B4_MIN_SPREAD        = 0.020
-B4_MIN_LIQUIDITY     = 500.0
+B4_MIN_LIQUIDITY     = 150.0
 B4_STANDBY_INTERVAL  = 1800  # segundos (30 min)
 B4_ACTIVE_INTERVAL   = 60    # segundos (1 min) quando há jogos ao vivo
 B4_LIVE_WINDOW_H     = 4     # jogo resolve em ≤ 4h

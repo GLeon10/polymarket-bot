@@ -643,8 +643,9 @@ def scan() -> list[ArbSignal]:
 
     res_ok = [s for s in all_signals if s.resolution_ok]
 
-    # Assess rule quality; LOW signals are discarded silently
+    # Assess rule quality; LOW signals are discarded (logged at INFO when no LLM key)
     valid: list[ArbSignal] = []
+    low_count = 0
     for sig in res_ok:
         rules_text = _rules_cache.get(sig.market_ids[0], "")
         quality, _ = rule_validator.assess(rules_text, sig.market_ids[0])
@@ -652,19 +653,19 @@ def scan() -> list[ArbSignal]:
         if quality in ("HIGH", "MEDIUM"):
             valid.append(sig)
         else:
-            logger.debug(
-                "[A] Descartado por qualidade LOW | %s", sig.description[:60]
+            low_count += 1
+            logger.info(
+                "[A] LOW quality descartado (spread=%.1f%%) | %s",
+                sig.spread * 100, sig.description[:60],
             )
 
     for sig in valid:
         _log_valid(sig)
 
-    if valid:
-        logger.info("[A] %d mercados | %d candidatos | %d sinal(is) valido(s)",
-                    len(all_markets), len(candidates), len(valid))
-    else:
-        logger.info("[A] %d mercados | %d candidatos | sem sinais",
-                    len(all_markets), len(candidates))
+    logger.info(
+        "[A] %d mercados | %d candidatos | %d brutos | %d LOW descartados | %d válido(s)",
+        len(all_markets), len(candidates), len(res_ok), low_count, len(valid),
+    )
 
     return valid
 

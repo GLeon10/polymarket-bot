@@ -400,7 +400,7 @@ class TestScannerA:
 
     def test_type1_rejects_fee_above_max(self):
         m = self._m("Will Brazil win the World Cup?", 0.40, "br")
-        m["taker_base_fee"] = 0.02
+        m["taker_base_fee"] = 0.03  # acima de A_MAX_FEE=0.025
         sigs = self._run([m, self._m("Will Argentina win the World Cup?", 0.35, "ar")])
         assert len(sigs) == 0
 
