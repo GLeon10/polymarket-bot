@@ -238,6 +238,19 @@ def _parse_threshold_value(text: str) -> float | None:
         return None
 
 
+def _fmt_threshold(v: float) -> str:
+    """Formata threshold para exibição legível: 19000000 → '19M', 1500 → '1.5K'."""
+    if abs(v) >= 1e9:
+        return f"{v/1e9:.3g}B"
+    if abs(v) >= 1e6:
+        return f"{v/1e6:.3g}M"
+    if abs(v) >= 1e3:
+        return f"{v/1e3:.3g}K"
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.4g}"
+
+
 def _stem_date(question: str) -> str | None:
     """Chave de grupo para mercados 'X by [date]': tudo antes do 'by [date]'."""
     m = _BY_DATE_RE.search(question)
@@ -492,8 +505,8 @@ def _detect_thresholds(candidates: list[dict]) -> list[ArbSignal]:
             )
             signals.append(_make_signal(
                 2,
-                f"Tipo 2 THRESHOLD — P(above {t_high:.4g})={p_high:.2%} > "
-                f"P(above {t_low:.4g})={p_low:.2%} — barra maior não pode custar mais",
+                f"Tipo 2 THRESHOLD — P(above {_fmt_threshold(t_high)})={p_high:.2%} > "
+                f"P(above {_fmt_threshold(t_low)})={p_low:.2%} — barra maior não pode custar mais",
                 [m_low, m_high], [p_low, p_high], spread, min_liq, res_ok, res_notes,
             ))
     return signals
