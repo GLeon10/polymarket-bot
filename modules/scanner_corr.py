@@ -68,6 +68,7 @@ class CorrSignal:
     pnl_est:     float        # P&L hipotético em USD ($50 de capital)
     market_ids:   list[str] = field(default_factory=list)
     market_slugs: list[str] = field(default_factory=list)
+    end_dates:    list[str] = field(default_factory=list)
     found_at:     datetime  = field(default_factory=datetime.utcnow)
 
 
@@ -298,6 +299,7 @@ def scan() -> list[CorrSignal]:
                 pnl_est    = round(spread * _CORR_TRADE_SIZE_USD, 2),
                 market_ids   = [m["condition_id"] for m in group],
                 market_slugs = [m.get("market_slug", "") for m in group],
+                end_dates    = [m.get("end_date_iso") or m.get("endDate") or "" for m in group],
             ))
 
         elif total < 1.0 - config.CORR_MIN_SPREAD and n == 2:
@@ -314,6 +316,7 @@ def scan() -> list[CorrSignal]:
                 pnl_est    = round(spread * _CORR_TRADE_SIZE_USD, 2),
                 market_ids   = [m["condition_id"] for m in group],
                 market_slugs = [m.get("market_slug", "") for m in group],
+                end_dates    = [m.get("end_date_iso") or m.get("endDate") or "" for m in group],
             ))
 
     # ── Padrão 3: SUBSET — P(A) > P(A ou B) ─────────────────────────────────
@@ -366,6 +369,8 @@ def scan() -> list[CorrSignal]:
                 pnl_est    = round(spread * _CORR_TRADE_SIZE_USD, 2),
                 market_ids   = [market["condition_id"], m_ind["condition_id"]],
                 market_slugs = [market.get("market_slug", ""), m_ind.get("market_slug", "")],
+                end_dates    = [market.get("end_date_iso") or market.get("endDate") or "",
+                                m_ind.get("end_date_iso") or m_ind.get("endDate") or ""],
             ))
 
     logger.info("[CORR] %d mercados | %d brutos detectados — aplicando filtros…",
@@ -397,6 +402,8 @@ def execute(signal: CorrSignal, client) -> bool:
         first_slug = signal.market_slugs[0] if signal.market_slugs else ""
         event_slug = clob_utils.get_event_slug(first_slug) if first_slug else ""
 
+        first_end = signal.end_dates[0] if signal.end_dates else None
+
         tracker.record_signal(
             "CORR",
             signal.market_ids[0] if signal.market_ids else "unknown",
@@ -404,6 +411,7 @@ def execute(signal: CorrSignal, client) -> bool:
             side,
             round(entry_price, 4),
             signal.spread,
+            closes_at_iso=first_end,
             market_slug=event_slug or first_slug,
             n_markets=len(signal.market_ids),
         )

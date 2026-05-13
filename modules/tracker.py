@@ -67,7 +67,13 @@ def _banca_b() -> float:
 def _trade_size(module: str) -> float:
     """Tamanho hipotético por operação, respeitando as fases."""
     if module == "A":
-        return min(50.0, config.CAPITAL_A * 0.10)
+        return min(config.A_TRADE_SIZE_USD, config.CAPITAL_A * 0.10)
+    if module == "CORR":
+        return config.A_TRADE_SIZE_USD   # arbitragem pura, mesmo porte que A
+    if module == "B3":
+        return config.B3_TRADE_SIZE_USD
+    if module == "B4":
+        return config.B4_TRADE_SIZE_USD
     banca = _banca_b()
     if banca <= 0:
         return config.MAX_TRADE_B_USD  # fallback para testes
