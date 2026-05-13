@@ -27,7 +27,7 @@ from datetime import datetime
 import requests
 
 from config import config
-from modules import clob_utils
+from modules import clob_utils, tracker
 
 logger = logging.getLogger("scanner_corr")
 
@@ -378,6 +378,27 @@ def execute(signal: CorrSignal, client) -> bool:
         for q, p in zip(signal.questions, signal.prices):
             logger.info("   YES=%.3f | %s", p, q[:70])
         logger.info("   %s", signal.description)
+
+        # Lado e preço médio de entrada dependem do padrão
+        if signal.pattern == "oversum":
+            side        = "No"
+            entry_price = sum(1.0 - p for p in signal.prices) / len(signal.prices)
+        elif signal.pattern == "undersum":
+            side        = "Yes"
+            entry_price = sum(signal.prices) / len(signal.prices)
+        else:  # subset
+            side        = "Yes/No"
+            entry_price = signal.prices[0]
+
+        tracker.record_signal(
+            "CORR",
+            signal.market_ids[0] if signal.market_ids else "unknown",
+            signal.description[:100],
+            side,
+            round(entry_price, 4),
+            signal.spread,
+            n_markets=len(signal.market_ids),
+        )
         return True
     logger.warning("Execução live CORR não implementada")
     return False

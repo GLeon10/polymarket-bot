@@ -33,6 +33,7 @@ from modules.oracle_b4 import (
 )
 from modules import rule_validator
 from modules.rule_validator import _keyword_quality
+from modules import scanner_corr as _scanner_corr_mod
 from modules.scanner_corr import (
     CorrSignal, _filter_fee, _filter_liquidity,
     _filter_exhaustiveness, _filter_resolution,
@@ -915,6 +916,37 @@ class TestScannerCorr:
         assert len(result) == 1
         assert result[0].spread < 0.10
         assert result[0].pnl_est == pytest.approx(result[0].spread * 50.0, abs=0.01)
+
+    # execute() ────────────────────────────────────────────────────────────────
+
+    def test_execute_oversum_records_no_side(self):
+        sig = self._sg(pattern="oversum", prices=[0.60, 0.55], spread=0.15,
+                       market_ids=["0xE1", "0xE2"])
+        recorded = {}
+        with patch("modules.scanner_corr.tracker.record_signal",
+                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
+            result = _scanner_corr_mod.execute(sig, client=None)
+        assert result is True
+        assert recorded["args"][0] == "CORR"
+        assert recorded["args"][3] == "No"
+        assert recorded["kwargs"]["n_markets"] == 2
+
+    def test_execute_undersum_records_yes_side(self):
+        sig = self._sg(pattern="undersum", prices=[0.30, 0.35], spread=0.35,
+                       market_ids=["0xE3", "0xE4"])
+        recorded = {}
+        with patch("modules.scanner_corr.tracker.record_signal",
+                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
+            _scanner_corr_mod.execute(sig, client=None)
+        assert recorded["args"][3] == "Yes"
+
+    def test_execute_subset_records_yes_no_side(self):
+        sig = self._sg(pattern="subset", market_ids=["0xE5", "0xE6"])
+        recorded = {}
+        with patch("modules.scanner_corr.tracker.record_signal",
+                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
+            _scanner_corr_mod.execute(sig, client=None)
+        assert recorded["args"][3] == "Yes/No"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
