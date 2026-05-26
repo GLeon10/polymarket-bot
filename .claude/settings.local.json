@@ -18,7 +18,10 @@
       "Bash(git push *)",
       "Bash(python -m pytest tests/test_oracle_b3.py tests/test_oracle_b4.py -v)",
       "Bash(python -m pytest --tb=short -q)",
-      "Bash(python -m pytest tests/test_all.py -q)"
+      "Bash(python -m pytest tests/test_all.py -q)",
+      "Bash(python -m pytest tests/test_all.py --collect-only -q)",
+      "Bash(python -c \"import gspread, scipy; print\\('gspread', gspread.__version__, '| scipy', scipy.__version__\\)\")",
+      "Bash(python -m pytest tests/test_all.py -v)"
     ]
   }
 }

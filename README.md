@@ -8,23 +8,26 @@ Roda em **dry-run por padrão** — registra sinais e calcula P&L hipotético se
 
 ## Como funciona
 
-O bot roda 7 módulos em paralelo, cada um com sua própria estratégia de detecção:
+O bot roda 8 módulos em paralelo, cada um com sua própria estratégia de detecção:
 
 ```
 main.py
-├── Módulo A     — Arbitragem combinatória entre mercados relacionados
-├── Módulo B1    — Oracle climático (modelo meteorológico vs. mercado)
-├── Módulo B2    — Oracle de esports (win-rate histórico vs. mercado)
-├── Módulo B3    — Oracle político (inconsistências em datas/candidatos)
-├── Módulo B4    — Oracle esportivo ao vivo (ML vs. spread)
-├── Módulo B5    — Spread capture em mercados BTC/ETH/SOL de 5 minutos via WebSocket
-└── Módulo CORR  — Scanner de correlações lógicas entre mercados
+├── Módulo A       — Arbitragem combinatória entre mercados relacionados
+├── Módulo B1      — Oracle climático (modelo meteorológico vs. mercado)
+├── Módulo B2      — Oracle de esports (win-rate histórico vs. mercado)
+├── Módulo B3      — Oracle político (inconsistências em datas/candidatos)
+├── Módulo B4      — Oracle esportivo ao vivo (ML vs. spread)
+├── Módulo B5      — Spread capture BTC/ETH/SOL 5-min via WebSocket (ARB)
+├── Módulo B5 Pro  — 3 estratégias crypto 5-min em loop asyncio único
+│                    ARB · NEAR_RES · REPRICING
+└── Módulo CORR    — Scanner de correlações lógicas entre mercados
 ```
 
 Quando um sinal é detectado:
 1. É gravado em `data/trades/signals.csv`
 2. Uma notificação é enviada via Telegram
 3. O tracker verifica a resolução e calcula P&L quando o mercado fecha
+4. O sinal é espelhado em tempo real no Google Sheets (se configurado)
 
 ---
 
@@ -64,10 +67,28 @@ p_up_ask + p_down_ask + fee(p_up) + fee(p_down) < 0.982
 fee(p) = 0.072 × p × (1 − p)
 ```
 
-- Preços em tempo real via WebSocket CLOB (`wss://ws-subscriptions-clob.polymarket.com`)
+- Preços em tempo real via WebSocket CLOB
 - Fallback automático para REST quando WebSocket indisponível
 - Janela de entrada: T+30s a T+240s após abertura do candle
 - $25 por lado ($50 total), ordens FAK
+
+### Módulo B5 Pro — Crypto 5-Min Multi-Strategy
+Versão avançada do B5 com 3 estratégias rodando num único loop asyncio com dois WebSockets em paralelo (CLOB + Binance):
+
+**ARB** — mesma lógica do B5, FAK separados por lado para eliminar risco de leg parcial.
+
+**NEAR_RES** — Near-resolution: entra no lado vencedor nos últimos 60s do candle quando o preço está entre 0.96 e 0.995. Edge mínimo de 0.5%. Emite flag `⚠️ TAIL_RISK` no Telegram.
+
+**REPRICING** — Fair value via Binance aggTrade WebSocket:
+```
+pct_change = (spot_now − open_candle) / open_candle
+z_score    = pct_change / volatilidade_20_candles
+fair_prob  = norm.cdf(z_score)          # scipy.stats
+sinal quando |fair_prob − poly_price| > 6%  e  liquidez ≥ $150
+```
+Loga sempre: `fair_prob`, `poly_price`, divergência e latência Binance→Poly.
+
+O campo `module` no CSV identifica a estratégia: `B5_ARB` / `B5_NEAR_RES` / `B5_REPRICING`.
 
 ### Módulo CORR — Correlation Scanner
 Detecta inconsistências de correlação entre mercados:
@@ -93,14 +114,17 @@ polymarket_bot/
 │   ├── oracle_b3.py         # Módulo B3
 │   ├── oracle_b4.py         # Módulo B4
 │   ├── oracle_b5.py         # Módulo B5
+│   ├── oracle_b5_pro.py     # Módulo B5 Pro (ARB + NEAR_RES + REPRICING)
 │   ├── scanner_corr.py      # Módulo CORR
 │   ├── tracker.py           # Gravação de sinais e P&L
 │   ├── notifier.py          # Notificações Telegram
+│   ├── sheets.py            # Espelho Google Sheets (opcional)
 │   ├── phase_manager.py     # Gestão de fases de capital
 │   ├── rule_validator.py    # Validação de regras via keywords + Claude Haiku
 │   └── clob_utils.py        # Utilitários da API Polymarket
+├── migrate_to_sheets.py     # Migração única CSV → Google Sheets
 ├── tests/
-│   └── test_all.py          # 235 testes (todos os módulos)
+│   └── test_all.py          # 264 testes (todos os módulos)
 └── data/
     ├── trades/
     │   ├── signals.csv      # Sinais emitidos
@@ -108,8 +132,8 @@ polymarket_bot/
     └── logs/
         ├── YYYY-MM-DD.log   # Log unificado do dia
         ├── scanner_a.log    # Log individual por módulo
-        ├── oracle_b1.log
         ├── oracle_b5.log
+        ├── oracle_b5_pro.log
         └── ...
 ```
 
@@ -125,7 +149,7 @@ cd polymarket_bot
 pip install -r requirements.txt
 ```
 
-> **VPS (Ubuntu/Debian):** se aparecer o erro `externally-managed-environment`, instale dentro de um virtualenv:
+> **VPS (Ubuntu/Debian):** se aparecer o erro `externally-managed-environment`, use virtualenv:
 > ```bash
 > python3 -m venv venv
 > source venv/bin/activate
@@ -151,6 +175,10 @@ POLY_API_PASSPHRASE=
 TELEGRAM_BOT_TOKEN=token_do_seu_bot
 TELEGRAM_CHAT_ID=seu_chat_id
 
+# Google Sheets (opcional — espelho dos CSVs)
+GOOGLE_SHEETS_ID=id_da_planilha
+GOOGLE_SERVICE_ACCOUNT_JSON=credentials.json
+
 # Claude Haiku (validação de regras de resolução — opcional)
 ANTHROPIC_API_KEY=sua_chave_anthropic
 ```
@@ -171,12 +199,15 @@ python main.py
 | `A_MIN_SPREAD` | 2% | Retorno mínimo líquido para sinal A |
 | `A_MAX_RESOLUTION_DAYS` | 60 dias | Janela de resolução máxima para módulo A |
 | `B1_MIN_DIVERGENCE` | 12% | Divergência mínima modelo vs. mercado (B1) |
-| `B1_MAX_SHARE_PRICE` | 40¢ | Preço máximo para entrar (reduz fee efetiva) |
 | `B2_MIN_DIVERGENCE` | 10% | Divergência mínima win-rate vs. mercado (B2) |
 | `B4_MIN_LIQUIDITY` | $150 | Liquidez mínima nos dois lados (B4) |
-| `B5_THRESHOLD` | 0.982 | Custo máximo total para sinal B5 (p_up + p_down + fee) |
+| `B5_THRESHOLD` | 0.982 | Custo máximo p_up + p_down + fee (B5 / B5 Pro ARB) |
 | `B5_FEE_RATE` | 7.2% | Taxa taker crypto: `rate × p × (1−p)` |
-| `B5_TRADE_SIZE_USD` | $25/lado | Capital por lado ($50 total) por operação B5 |
+| `B5_TRADE_SIZE_USD` | $25/lado | Capital por lado por operação B5/B5 Pro |
+| `B5_NEAR_RES_PRICE_MIN` | 0.96 | Preço mínimo para NEAR_RES |
+| `B5_NEAR_RES_PRICE_MAX` | 0.995 | Preço máximo para NEAR_RES |
+| `B5_REPRICING_MIN_DIVERGENCE` | 6% | Divergência mínima fair vs. poly (REPRICING) |
+| `B5_REPRICING_MIN_LIQUIDITY` | $150 | Liquidez mínima no lado a comprar (REPRICING) |
 | `TOTAL_CAPITAL` | $500 | Capital total gerenciado pelo bot |
 
 Todos os parâmetros estão em [config/config.py](config/config.py).
@@ -187,7 +218,7 @@ Todos os parâmetros estão em [config/config.py](config/config.py).
 
 **Fase 1 (inicial):**
 - 90% do capital vai para o Módulo A
-- B1, B2, B3, B4, B5 ficam em standby sem capital próprio
+- B1, B2, B3, B4, B5, B5 Pro ficam em standby sem capital próprio
 
 **Fase 2 (ativada quando A acumula $45 em P&L):**
 - Os lucros de A formam a "Banca B"
@@ -197,8 +228,6 @@ Todos os parâmetros estão em [config/config.py](config/config.py).
 ---
 
 ## Notificações Telegram
-
-Cada sinal detectado gera uma mensagem no formato:
 
 **Módulo A / CORR:**
 ```
@@ -218,13 +247,55 @@ https://polymarket.com/event/...
 
 Lado: Yes+No | Entrada: 0.440
 Spread: 6.8% | P&L est: $3.40
-Capital: $50.00 | Fecha: 2026-05-13 19:55 BRT
+Capital: $25.00 | Fecha: 2026-05-13 19:55 BRT
 https://polymarket.com/event/...
+```
+
+**Módulo B5 Pro — ARB:**
+```
+[SINAL B5_ARB] (2 mercados)
+[ARB] BTC edge=6.8%: Will BTC be above $90k in 5 min?
+
+Lado: Yes+No | Entrada: 0.440
+Spread: 6.8% | P&L est: $1.70
+Capital: $25.00 | Fecha: 2026-05-13 19:55 BRT
+```
+
+**Módulo B5 Pro — NEAR_RES:**
+```
+[SINAL B5_NEAR_RES]
+[NEAR_RES] ⚠️ TAIL_RISK BTC edge=1.2%: Will BTC be above $90k in 5 min?
+
+Lado: Yes | Entrada: 0.982
+Spread: 1.2% | P&L est: $0.30
+Capital: $25.00 | Fecha: 2026-05-13 19:59 BRT
+```
+
+**Módulo B5 Pro — REPRICING:**
+```
+[SINAL B5_REPRICING]
+[REPRICING] BTC edge=4.1% | fair=0.720 poly=0.670 lat=18ms: Will BTC...
+
+Lado: Yes | Entrada: 0.670
+Spread: 4.1% | P&L est: $1.03
+Capital: $25.00 | Fecha: 2026-05-13 19:55 BRT
 ```
 
 Para configurar o bot do Telegram:
 1. Abra [@BotFather](https://t.me/BotFather) e crie um bot — obtenha o `TELEGRAM_BOT_TOKEN`
 2. Envie uma mensagem para o bot e abra `https://api.telegram.org/bot<TOKEN>/getUpdates` para obter o `TELEGRAM_CHAT_ID`
+
+---
+
+## Google Sheets
+
+Os sinais e resoluções são espelhados automaticamente em uma planilha Google (abas **Signals** e **Resolved**). Configuração:
+
+1. Crie um projeto no [Google Cloud Console](https://console.cloud.google.com) e ative as APIs **Google Sheets** e **Google Drive**
+2. Crie uma **Service Account**, baixe o JSON e salve como `credentials.json` na raiz do projeto
+3. Compartilhe a planilha com o e-mail da service account (permissão **Editor**)
+4. Configure no `.env`: `GOOGLE_SHEETS_ID=...` e `GOOGLE_SERVICE_ACCOUNT_JSON=credentials.json`
+5. Para migrar sinais existentes: `python migrate_to_sheets.py`
 
 ---
 
@@ -234,7 +305,7 @@ Para configurar o bot do Telegram:
 python -m pytest tests/test_all.py -v
 ```
 
-235 testes cobrindo todos os módulos: detecção, filtros, WebSocket, integração com mocks e casos de borda.
+264 testes cobrindo todos os módulos: detecção, filtros, WebSocket, Binance feed, fair value, integração com mocks e casos de borda.
 
 ---
 
@@ -266,7 +337,7 @@ journalctl -u polymarket-bot -f
 cd ~/polymarket_bot
 git pull
 source venv/bin/activate
-pip install -r requirements.txt   # instala novas dependências, se houver
+pip install -r requirements.txt
 sudo systemctl restart polymarket-bot
 ```
 
@@ -287,6 +358,6 @@ cat ~/polymarket_bot/data/trades/resolved.csv
 
 ## Segurança
 
-- **Nunca compartilhe sua `PRIVATE_KEY`**
+- **Nunca compartilhe sua `PRIVATE_KEY` ou `credentials.json`** — ambos estão no `.gitignore`
 - O bot opera em `dry_run` por padrão — não executa trades reais
 - Para operar em `live`, altere `MODE=live` no `.env` e certifique-se de que a wallet tem fundos em USDC na rede Polygon
