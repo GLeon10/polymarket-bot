@@ -16,7 +16,7 @@ from pathlib import Path
 import requests
 
 from config import config
-from modules import notifier
+from modules import notifier, sheets
 
 logger = logging.getLogger("tracker")
 
@@ -144,6 +144,7 @@ def record_signal(module: str, market_id: str, question: str,
         "n_markets":   n_markets,
     }
     _append(_SIGNALS_PATH, _SIGNALS_HEADER, row)
+    sheets.append_signal(row)
     logger.info(
         "TRACKER | %s | %s | side=%s price=%.3f edge=%.1f%% size=$%.2f",
         module, question[:50], side, entry_price, edge * 100, size,
@@ -229,6 +230,7 @@ def check_resolutions():
             "resolved_at": _now_brt(),
         }
         _append(_RESOLVED_PATH, _RESOLVED_HEADER, row)
+        sheets.append_resolved(row)
         logger.info(
             "TRACKER | Resolvido: %s | side=%s res=%s pnl=$%.2f",
             signal["question"][:50], signal["side"], resolution, pnl,

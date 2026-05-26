@@ -174,6 +174,12 @@ B5_SCAN_INTERVAL  = 60        # segundos (1 min)
 # ── Risco ────────────────────────────────────────────────────────────────────
 B_MONTHLY_STOP_LOSS = -0.10   # -10% do capital alocado em B → pausar B
 
+# ── Google Sheets (espelho opcional dos CSVs) ─────────────────────────────────
+# ID da planilha: string entre /d/ e /edit na URL do Google Sheets
+GOOGLE_SHEETS_ID:            str = os.getenv("GOOGLE_SHEETS_ID", "")
+# Caminho para o JSON da service account (relativo à raiz do projeto)
+GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "credentials.json")
+
 # ── Validação de inicialização ───────────────────────────────────────────────
 def validate():
     errors = []
