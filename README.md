@@ -8,7 +8,7 @@ Roda em **dry-run por padrão** — registra sinais e calcula P&L hipotético se
 
 ## Como funciona
 
-O bot roda 6 módulos em paralelo, cada um com sua própria estratégia de detecção:
+O bot roda 7 módulos em paralelo, cada um com sua própria estratégia de detecção:
 
 ```
 main.py
@@ -17,6 +17,7 @@ main.py
 ├── Módulo B2    — Oracle de esports (win-rate histórico vs. mercado)
 ├── Módulo B3    — Oracle político (inconsistências em datas/candidatos)
 ├── Módulo B4    — Oracle esportivo ao vivo (ML vs. spread)
+├── Módulo B5    — Spread capture em mercados BTC/ETH/SOL de 5 minutos via WebSocket
 └── Módulo CORR  — Scanner de correlações lógicas entre mercados
 ```
 
@@ -31,7 +32,7 @@ Quando um sinal é detectado:
 
 ### Módulo A — Arbitragem Combinatória
 Detecta quando a soma das probabilidades de mercados mutuamente exclusivos diverge de 100%:
-- **Tipo 1 (Soma de partes):** `P(A ganhar) + P(B ganhar) + P(C ganhar) ≠ 100%`
+- **Tipo 1 (Soma de partes):** `P(A) + P(B) + P(C) ≠ 100%`
 - **Tipo 2 (Subconjunto):** `P(A ganhar torneio) > P(A ou B ganhar torneio)` — impossível matematicamente
 - **Tipo 3 (Implicação):** `P(ganhar o título) > P(chegar à final)` — quem ganha o título necessariamente passou pela final
 
@@ -53,6 +54,20 @@ Detecta inconsistências lógicas em mercados políticos:
 ### Módulo B4 — Sports Live Oracle
 Detecta quando o preço moneyline (ML) de uma equipe é maior que o preço do spread para a mesma equipe — matematicamente impossível.
 Modo standby (30 min) quando não há jogos ao vivo, modo ativo (60s) quando detecta partidas.
+
+### Módulo B5 — Crypto 5-Min Spread Capture
+Arbitragem intra-candle em mercados binários de 5 minutos (BTC, ETH, SOL).
+Compra YES e NO do mesmo mercado quando o custo total (incluindo fee) é menor que o threshold:
+
+```
+p_up_ask + p_down_ask + fee(p_up) + fee(p_down) < 0.982
+fee(p) = 0.072 × p × (1 − p)
+```
+
+- Preços em tempo real via WebSocket CLOB (`wss://ws-subscriptions-clob.polymarket.com`)
+- Fallback automático para REST quando WebSocket indisponível
+- Janela de entrada: T+30s a T+240s após abertura do candle
+- $25 por lado ($50 total), ordens FAK
 
 ### Módulo CORR — Correlation Scanner
 Detecta inconsistências de correlação entre mercados:
@@ -77,6 +92,7 @@ polymarket_bot/
 │   ├── oracle_b2.py         # Módulo B2
 │   ├── oracle_b3.py         # Módulo B3
 │   ├── oracle_b4.py         # Módulo B4
+│   ├── oracle_b5.py         # Módulo B5
 │   ├── scanner_corr.py      # Módulo CORR
 │   ├── tracker.py           # Gravação de sinais e P&L
 │   ├── notifier.py          # Notificações Telegram
@@ -84,7 +100,7 @@ polymarket_bot/
 │   ├── rule_validator.py    # Validação de regras via keywords + Claude Haiku
 │   └── clob_utils.py        # Utilitários da API Polymarket
 ├── tests/
-│   └── test_all.py          # 202 testes (todos os módulos)
+│   └── test_all.py          # 235 testes (todos os módulos)
 └── data/
     ├── trades/
     │   ├── signals.csv      # Sinais emitidos
@@ -93,6 +109,7 @@ polymarket_bot/
         ├── YYYY-MM-DD.log   # Log unificado do dia
         ├── scanner_a.log    # Log individual por módulo
         ├── oracle_b1.log
+        ├── oracle_b5.log
         └── ...
 ```
 
@@ -107,6 +124,13 @@ git clone https://github.com/GLeon10/polymarket-bot.git
 cd polymarket_bot
 pip install -r requirements.txt
 ```
+
+> **VPS (Ubuntu/Debian):** se aparecer o erro `externally-managed-environment`, instale dentro de um virtualenv:
+> ```bash
+> python3 -m venv venv
+> source venv/bin/activate
+> pip install -r requirements.txt
+> ```
 
 ### 2. Criar o arquivo `.env`
 
@@ -150,6 +174,9 @@ python main.py
 | `B1_MAX_SHARE_PRICE` | 40¢ | Preço máximo para entrar (reduz fee efetiva) |
 | `B2_MIN_DIVERGENCE` | 10% | Divergência mínima win-rate vs. mercado (B2) |
 | `B4_MIN_LIQUIDITY` | $150 | Liquidez mínima nos dois lados (B4) |
+| `B5_THRESHOLD` | 0.982 | Custo máximo total para sinal B5 (p_up + p_down + fee) |
+| `B5_FEE_RATE` | 7.2% | Taxa taker crypto: `rate × p × (1−p)` |
+| `B5_TRADE_SIZE_USD` | $25/lado | Capital por lado ($50 total) por operação B5 |
 | `TOTAL_CAPITAL` | $500 | Capital total gerenciado pelo bot |
 
 Todos os parâmetros estão em [config/config.py](config/config.py).
@@ -160,7 +187,7 @@ Todos os parâmetros estão em [config/config.py](config/config.py).
 
 **Fase 1 (inicial):**
 - 90% do capital vai para o Módulo A
-- B1, B2, B3, B4 ficam em standby sem capital próprio
+- B1, B2, B3, B4, B5 ficam em standby sem capital próprio
 
 **Fase 2 (ativada quando A acumula $45 em P&L):**
 - Os lucros de A formam a "Banca B"
@@ -173,6 +200,7 @@ Todos os parâmetros estão em [config/config.py](config/config.py).
 
 Cada sinal detectado gera uma mensagem no formato:
 
+**Módulo A / CORR:**
 ```
 [SINAL A]
 Tipo 1 UNDERSUM — 'the championship' (3 candidatos): soma YES=72%
@@ -180,6 +208,17 @@ Tipo 1 UNDERSUM — 'the championship' (3 candidatos): soma YES=72%
 Lado: arb-t1 | Entrada: 0.240
 Spread: 4.2% | P&L est: $2.10
 Capital: $50.00 | Fecha: 2026-05-20 18:00 BRT
+https://polymarket.com/event/...
+```
+
+**Módulo B5:**
+```
+[SINAL B5] (2 mercados)
+[B5] BTC 5-min: Will BTC be above $90k in 5 min?
+
+Lado: Yes+No | Entrada: 0.440
+Spread: 6.8% | P&L est: $3.40
+Capital: $50.00 | Fecha: 2026-05-13 19:55 BRT
 https://polymarket.com/event/...
 ```
 
@@ -195,15 +234,22 @@ Para configurar o bot do Telegram:
 python -m pytest tests/test_all.py -v
 ```
 
-202 testes cobrindo todos os módulos: detecção, filtros, integração com mocks e casos de borda.
+235 testes cobrindo todos os módulos: detecção, filtros, WebSocket, integração com mocks e casos de borda.
 
 ---
 
 ## Deploy em VPS (Linux)
 
 ```bash
-# Instalar dependências
+# Clonar e criar virtualenv
+git clone https://github.com/GLeon10/polymarket-bot.git
+cd polymarket_bot
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+
+# Configurar .env
+nano .env   # preencha com suas chaves
 
 # Configurar como serviço systemd
 cp polymarket-bot.service /etc/systemd/system/
@@ -212,6 +258,29 @@ systemctl start polymarket-bot
 
 # Acompanhar logs em tempo real
 journalctl -u polymarket-bot -f
+```
+
+### Atualizar a VPS após push
+
+```bash
+cd ~/polymarket_bot
+git pull
+source venv/bin/activate
+pip install -r requirements.txt   # instala novas dependências, se houver
+sudo systemctl restart polymarket-bot
+```
+
+### Consultar sinais na VPS
+
+```bash
+# Sinais emitidos
+cat ~/polymarket_bot/data/trades/signals.csv
+
+# Formatado em colunas
+column -t -s, ~/polymarket_bot/data/trades/signals.csv
+
+# Sinais resolvidos com P&L
+cat ~/polymarket_bot/data/trades/resolved.csv
 ```
 
 ---
