@@ -4,6 +4,7 @@ Execute com:  pytest tests/test_all.py -q
 """
 
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
 
@@ -38,6 +39,12 @@ import modules.oracle_b5 as oracle_b5_mod
 from modules.oracle_b5 import (
     _fee, _total_cost, _in_entry_window, _is_5min_crypto, _detect_asset,
     CryptoSpreadSignal,
+)
+import modules.oracle_b5_pro as oracle_b5_pro_mod
+from modules.oracle_b5_pro import (
+    B5ProSignal,
+    _fee as _b5p_fee,
+    _in_arb_window, _in_near_res_window,
 )
 from modules.scanner_corr import (
     CorrSignal, _filter_fee, _filter_liquidity,
@@ -1652,3 +1659,311 @@ class TestOracleB5:
             oracle_b5_mod.execute(self._sig(), client=None)   # segunda chamada
         oracle_b5_mod._executed.discard("0xB5EX")
         assert len(calls) == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# oracle_b5_pro
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOracleB5Pro:
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def setup_method(self):
+        """Limpa estado global antes de cada teste."""
+        oracle_b5_pro_mod._executed.clear()
+        while not oracle_b5_pro_mod._signal_queue.empty():
+            try:
+                oracle_b5_pro_mod._signal_queue.get_nowait()
+            except Exception:
+                break
+        with oracle_b5_pro_mod._clob_lock:
+            oracle_b5_pro_mod._clob_ask.clear()
+        with oracle_b5_pro_mod._binance_lock:
+            oracle_b5_pro_mod._binance_price.clear()
+        with oracle_b5_pro_mod._vol_lock:
+            for d in oracle_b5_pro_mod._vol_window.values():
+                d.clear()
+
+    @staticmethod
+    def _info(secs_to_end=180, question="Will BTC be above $90000 in 5 min?"):
+        return {
+            "yes_id":   "yes_tok",
+            "no_id":    "no_tok",
+            "end_time": datetime.now(timezone.utc) + timedelta(seconds=secs_to_end),
+            "slug":     "btc-5min-test",
+            "question": question,
+        }
+
+    @staticmethod
+    def _sig(strategy="ARB", side="Yes+No", market_id="0xPROEX"):
+        end = datetime.now(timezone.utc) + timedelta(seconds=120)
+        return B5ProSignal(
+            strategy=strategy, market_id=market_id,
+            question="Will BTC be above $90k in 5 min?",
+            asset="BTC", side=side,
+            entry_price=0.44, edge=0.06,
+            size_usd=25.0, end_time=end,
+        )
+
+    # ── janelas de tempo ──────────────────────────────────────────────────────
+
+    def test_arb_window_at_120s_from_end(self):
+        # secs_left=120 → elapsed=180 → in [30, 240]
+        end = datetime.now(timezone.utc) + timedelta(seconds=120)
+        assert _in_arb_window(end) is True
+
+    def test_arb_window_too_early(self):
+        # secs_left=290 → elapsed=10 → below 30
+        end = datetime.now(timezone.utc) + timedelta(seconds=290)
+        assert _in_arb_window(end) is False
+
+    def test_arb_window_too_late(self):
+        # secs_left=30 → elapsed=270 → above 240
+        end = datetime.now(timezone.utc) + timedelta(seconds=30)
+        assert _in_arb_window(end) is False
+
+    def test_near_res_window_at_30s(self):
+        end = datetime.now(timezone.utc) + timedelta(seconds=30)
+        assert _in_near_res_window(end) is True
+
+    def test_near_res_window_too_far(self):
+        end = datetime.now(timezone.utc) + timedelta(seconds=180)
+        assert _in_near_res_window(end) is False
+
+    def test_near_res_window_too_close(self):
+        # secs_left=5 < 10 (WINDOW_END_S)
+        end = datetime.now(timezone.utc) + timedelta(seconds=5)
+        assert _in_near_res_window(end) is False
+
+    # ── Estratégia 1: ARB ────────────────────────────────────────────────────
+
+    def test_arb_detects_when_cost_below_threshold(self):
+        # p=0.44 each: cost ≈ 0.914 < 0.982
+        info = self._info(secs_to_end=120)
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.44):
+            sig = oracle_b5_pro_mod._detect_arb("0xARB1", info)
+        assert sig is not None
+        assert sig.strategy == "ARB"
+        assert sig.side == "Yes+No"
+        assert sig.edge > 0
+
+    def test_arb_no_signal_above_threshold(self):
+        # p=0.50 each: cost = 1.0 + fees > 0.982
+        info = self._info(secs_to_end=120)
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.50):
+            sig = oracle_b5_pro_mod._detect_arb("0xARB2", info)
+        assert sig is None
+
+    def test_arb_no_signal_outside_window(self):
+        # secs_to_end=290 → too early (elapsed=10s)
+        info = self._info(secs_to_end=290)
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.44):
+            sig = oracle_b5_pro_mod._detect_arb("0xARB3", info)
+        assert sig is None
+
+    def test_arb_no_signal_if_already_executed(self):
+        info = self._info(secs_to_end=120)
+        oracle_b5_pro_mod._executed.add("0xARB4:ARB")
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.44):
+            sig = oracle_b5_pro_mod._detect_arb("0xARB4", info)
+        assert sig is None
+
+    # ── Estratégia 2: NEAR_RES ────────────────────────────────────────────────
+
+    def test_near_res_detects_yes_side(self):
+        # secs_to_end=30 → in NEAR_RES window; YES ask=0.975 ∈ [0.96, 0.995]
+        info = self._info(secs_to_end=30)
+        with patch.object(oracle_b5_pro_mod, "_ask",
+                          side_effect=lambda t: 0.975 if t == "yes_tok" else 0.02):
+            sig = oracle_b5_pro_mod._detect_near_res("0xNR1", info)
+        assert sig is not None
+        assert sig.strategy == "NEAR_RES"
+        assert sig.side == "Yes"
+        assert sig.tail_risk is True
+
+    def test_near_res_detects_no_side_when_yes_out_of_range(self):
+        # YES ask=0.50 (out of range), NO ask=0.975
+        info = self._info(secs_to_end=30)
+        with patch.object(oracle_b5_pro_mod, "_ask",
+                          side_effect=lambda t: 0.50 if t == "yes_tok" else 0.975):
+            sig = oracle_b5_pro_mod._detect_near_res("0xNR2", info)
+        assert sig is not None and sig.side == "No"
+
+    def test_near_res_no_signal_outside_window(self):
+        info = self._info(secs_to_end=180)
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.975):
+            sig = oracle_b5_pro_mod._detect_near_res("0xNR3", info)
+        assert sig is None
+
+    def test_near_res_no_signal_price_below_range(self):
+        # price=0.90 < 0.96
+        info = self._info(secs_to_end=30)
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.90):
+            sig = oracle_b5_pro_mod._detect_near_res("0xNR4", info)
+        assert sig is None
+
+    def test_near_res_no_signal_edge_too_small(self):
+        # price=0.996 → edge = 1 - 0.996 - fee(0.996) ≈ 0.004 < 0.005
+        info = self._info(secs_to_end=30)
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.996):
+            sig = oracle_b5_pro_mod._detect_near_res("0xNR5", info)
+        assert sig is None
+
+    def test_near_res_edge_calculation(self):
+        info = self._info(secs_to_end=30)
+        p = 0.975
+        with patch.object(oracle_b5_pro_mod, "_ask",
+                          side_effect=lambda t: p if t == "yes_tok" else 0.02):
+            sig = oracle_b5_pro_mod._detect_near_res("0xNR6", info)
+        expected_edge = round(1.0 - p - _b5p_fee(p), 4)
+        assert sig is not None
+        assert abs(sig.edge - expected_edge) < 1e-6
+
+    # ── Estratégia 3: REPRICING ───────────────────────────────────────────────
+
+    def test_repricing_detects_divergence(self):
+        pytest.importorskip("scipy")
+        # BTC spot=90450, open=90000 → pct=0.005; vol≈0.012; z≈0.42; fair≈0.66
+        # YES ask=0.50 → divergence≈0.16 > 0.06 → sinal YES
+        info = self._info(secs_to_end=120, question="Will BTC be above $90000 in 5 min?")
+        vol_returns = [0.02, -0.01, 0.015, -0.005, 0.01,
+                       -0.02, 0.005, 0.0,  0.025, -0.015]
+        with oracle_b5_pro_mod._vol_lock:
+            for v in vol_returns:
+                oracle_b5_pro_mod._vol_window["BTC"].append(v)
+
+        with patch.object(oracle_b5_pro_mod, "_binance_spot", return_value=90450.0), \
+             patch.object(oracle_b5_pro_mod, "_binance_open", return_value=90000.0), \
+             patch.object(oracle_b5_pro_mod, "_binance_ts",   return_value=time.time()), \
+             patch.object(oracle_b5_pro_mod, "_ask",          return_value=0.50), \
+             patch("modules.oracle_b5_pro.clob_utils.get_orderbook_liquidity", return_value=200.0):
+            sig = oracle_b5_pro_mod._detect_repricing("0xRP1", info)
+
+        assert sig is not None
+        assert sig.strategy == "REPRICING"
+        assert sig.fair_prob is not None
+        assert sig.fair_prob > 0.50
+        assert sig.edge > 0
+
+    def test_repricing_no_signal_below_divergence(self):
+        pytest.importorskip("scipy")
+        info = self._info(secs_to_end=120, question="Will BTC be above $90000 in 5 min?")
+        vol_returns = [0.02, -0.01, 0.015, -0.005, 0.01,
+                       -0.02, 0.005, 0.0,  0.025, -0.015]
+        with oracle_b5_pro_mod._vol_lock:
+            for v in vol_returns:
+                oracle_b5_pro_mod._vol_window["BTC"].append(v)
+
+        with patch.object(oracle_b5_pro_mod, "_binance_spot", return_value=90450.0), \
+             patch.object(oracle_b5_pro_mod, "_binance_open", return_value=90000.0), \
+             patch.object(oracle_b5_pro_mod, "_binance_ts",   return_value=time.time()), \
+             patch.object(oracle_b5_pro_mod, "_ask",          return_value=0.64), \
+             patch("modules.oracle_b5_pro.clob_utils.get_orderbook_liquidity", return_value=200.0):
+            sig = oracle_b5_pro_mod._detect_repricing("0xRP2", info)
+
+        # fair≈0.66, poly=0.64 → divergence≈0.02 < 0.06 → sem sinal
+        assert sig is None
+
+    def test_repricing_no_signal_insufficient_liquidity(self):
+        pytest.importorskip("scipy")
+        info = self._info(secs_to_end=120, question="Will BTC be above $90000 in 5 min?")
+        vol_returns = [0.02, -0.01, 0.015, -0.005, 0.01,
+                       -0.02, 0.005, 0.0,  0.025, -0.015]
+        with oracle_b5_pro_mod._vol_lock:
+            for v in vol_returns:
+                oracle_b5_pro_mod._vol_window["BTC"].append(v)
+
+        with patch.object(oracle_b5_pro_mod, "_binance_spot", return_value=90450.0), \
+             patch.object(oracle_b5_pro_mod, "_binance_open", return_value=90000.0), \
+             patch.object(oracle_b5_pro_mod, "_binance_ts",   return_value=time.time()), \
+             patch.object(oracle_b5_pro_mod, "_ask",          return_value=0.50), \
+             patch("modules.oracle_b5_pro.clob_utils.get_orderbook_liquidity", return_value=50.0):
+            sig = oracle_b5_pro_mod._detect_repricing("0xRP3", info)
+        assert sig is None
+
+    def test_repricing_no_signal_without_binance_data(self):
+        pytest.importorskip("scipy")
+        info = self._info(secs_to_end=120, question="Will BTC be above $90000 in 5 min?")
+        # sem dados Binance → retorna None
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.50):
+            sig = oracle_b5_pro_mod._detect_repricing("0xRP4", info)
+        assert sig is None
+
+    def test_repricing_no_signal_without_volatility(self):
+        pytest.importorskip("scipy")
+        info = self._info(secs_to_end=120, question="Will BTC be above $90000 in 5 min?")
+        # _vol_window vazio → vol=None → retorna None
+        with patch.object(oracle_b5_pro_mod, "_binance_spot", return_value=90450.0), \
+             patch.object(oracle_b5_pro_mod, "_binance_open", return_value=90000.0), \
+             patch.object(oracle_b5_pro_mod, "_binance_ts",   return_value=time.time()), \
+             patch.object(oracle_b5_pro_mod, "_ask",          return_value=0.50):
+            sig = oracle_b5_pro_mod._detect_repricing("0xRP5", info)
+        assert sig is None
+
+    # ── REST fallback ─────────────────────────────────────────────────────────
+
+    def test_rest_fallback_when_ws_cache_empty(self):
+        # _clob_ask vazio → _ask() deve chamar _rest_ask()
+        with patch.object(oracle_b5_pro_mod, "_rest_ask", return_value=0.44) as mock_rest:
+            price = oracle_b5_pro_mod._ask("some_token")
+        mock_rest.assert_called_once_with("some_token")
+        assert price == pytest.approx(0.44)
+
+    def test_ws_cache_takes_priority_over_rest(self):
+        with oracle_b5_pro_mod._clob_lock:
+            oracle_b5_pro_mod._clob_ask["cached_tok"] = 0.37
+        with patch.object(oracle_b5_pro_mod, "_rest_ask", return_value=0.99) as mock_rest:
+            price = oracle_b5_pro_mod._ask("cached_tok")
+        mock_rest.assert_not_called()
+        assert price == pytest.approx(0.37)
+
+    # ── execute() ────────────────────────────────────────────────────────────
+
+    def test_execute_arb_returns_true(self):
+        with patch("modules.oracle_b5_pro.tracker.record_signal"):
+            assert oracle_b5_pro_mod.execute(self._sig("ARB"), None) is True
+
+    def test_execute_arb_records_correct_module(self):
+        recorded = {}
+        with patch("modules.oracle_b5_pro.tracker.record_signal",
+                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
+            oracle_b5_pro_mod.execute(self._sig("ARB"), None)
+        assert recorded["args"][0] == "B5_ARB"
+        assert recorded["args"][3] == "Yes+No"
+        assert recorded["kwargs"]["n_markets"] == 2
+
+    def test_execute_near_res_records_correct_module(self):
+        recorded = {}
+        with patch("modules.oracle_b5_pro.tracker.record_signal",
+                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
+            oracle_b5_pro_mod.execute(self._sig("NEAR_RES", side="Yes"), None)
+        assert recorded["args"][0] == "B5_NEAR_RES"
+        assert recorded["args"][3] == "Yes"
+        assert recorded["kwargs"]["n_markets"] == 1
+
+    def test_execute_deduplicates_arb(self):
+        calls = []
+        with patch("modules.oracle_b5_pro.tracker.record_signal",
+                   side_effect=lambda *a, **kw: calls.append(1)):
+            oracle_b5_pro_mod.execute(self._sig("ARB"), None)
+            oracle_b5_pro_mod.execute(self._sig("ARB"), None)  # duplicata
+        assert len(calls) == 1
+
+    def test_execute_deduplicates_near_res_per_side(self):
+        # Yes e No são entradas independentes — cada uma deduplica separadamente
+        calls = []
+        with patch("modules.oracle_b5_pro.tracker.record_signal",
+                   side_effect=lambda *a, **kw: calls.append(kw.get("n_markets"))):
+            oracle_b5_pro_mod.execute(self._sig("NEAR_RES", "Yes", "0xNRD"), None)
+            oracle_b5_pro_mod.execute(self._sig("NEAR_RES", "No",  "0xNRD"), None)
+            oracle_b5_pro_mod.execute(self._sig("NEAR_RES", "Yes", "0xNRD"), None)  # dup
+        assert len(calls) == 2  # Yes + No passam; segunda Yes bloqueada
+
+    def test_execute_includes_strategy_in_question(self):
+        recorded = {}
+        with patch("modules.oracle_b5_pro.tracker.record_signal",
+                   side_effect=lambda *a, **kw: recorded.update({"args": a})):
+            oracle_b5_pro_mod.execute(self._sig("REPRICING", "Yes", "0xRPQ"), None)
+        question = recorded["args"][2]
+        assert "REPRICING" in question

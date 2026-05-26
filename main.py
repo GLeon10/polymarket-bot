@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from config import config
-from modules import scanner_a, oracle_b1, oracle_b2, oracle_b3, oracle_b4, oracle_b5, scanner_corr, tracker, phase_manager
+from modules import scanner_a, oracle_b1, oracle_b2, oracle_b3, oracle_b4, oracle_b5, oracle_b5_pro, scanner_corr, tracker, phase_manager
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ def _setup_logging():
 
     # Logs individuais por módulo (escrita paralela ao log unificado)
     module_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    for module_name in ("scanner_a", "scanner_corr", "oracle_b1", "oracle_b2", "oracle_b3", "oracle_b4", "oracle_b5"):
+    for module_name in ("scanner_a", "scanner_corr", "oracle_b1", "oracle_b2", "oracle_b3", "oracle_b4", "oracle_b5", "oracle_b5_pro"):
         fh = logging.FileHandler(log_dir / f"{module_name}.log", encoding="utf-8")
         fh.setFormatter(module_fmt)
         logging.getLogger(module_name).addHandler(fh)
@@ -197,6 +197,18 @@ def main():
         t_b5.start()
     else:
         logger.info("Estratégia B5 DESATIVADA (STRATEGY_B5_ENABLED=false)")
+
+    if config.STRATEGY_B5_PRO_ENABLED:
+        active.append("B5Pro")
+        t_b5p = threading.Thread(
+            target=_run_loop,
+            args=("B5Pro", config.B5_SCAN_INTERVAL,
+                  oracle_b5_pro.scan, oracle_b5_pro.execute, client),
+            daemon=True, name="thread-B5Pro",
+        )
+        t_b5p.start()
+    else:
+        logger.info("Estratégia B5Pro DESATIVADA (STRATEGY_B5_PRO_ENABLED=false)")
 
     t_phase = threading.Thread(target=_phase_loop, daemon=True, name="thread-phase")
     t_phase.start()

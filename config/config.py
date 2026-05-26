@@ -171,6 +171,20 @@ B5_T_ENTRY_MAX_S  = 240       # segundos após abertura do candle: fim da janela
 B5_CANDLE_SECS    = 300       # duração do candle (5 minutos)
 B5_SCAN_INTERVAL  = 60        # segundos (1 min)
 
+# ── Módulo B5 Pro — Multi-Strategy ───────────────────────────────────────────
+STRATEGY_B5_PRO_ENABLED: bool = os.getenv("STRATEGY_B5_PRO_ENABLED", "true").lower() == "true"
+# ARB: mesmos parâmetros do B5 acima
+# NEAR_RES
+B5_NEAR_RES_PRICE_MIN      = 0.96    # preço mínimo do lado vencedor
+B5_NEAR_RES_PRICE_MAX      = 0.995   # preço máximo do lado vencedor
+B5_NEAR_RES_MIN_EDGE       = 0.005   # edge mínimo após fee (0.5%)
+B5_NEAR_RES_WINDOW_START_S = 60      # T-60s antes do fechamento
+B5_NEAR_RES_WINDOW_END_S   = 10      # T-10s antes do fechamento
+# REPRICING
+B5_REPRICING_MIN_DIVERGENCE = 0.06   # divergência mínima fair vs. poly
+B5_REPRICING_MIN_LIQUIDITY  = 150.0  # liquidez mínima no lado a comprar
+B5_REPRICING_VOL_CANDLES    = 20     # janela rolante de retornos para vol
+
 # ── Risco ────────────────────────────────────────────────────────────────────
 B_MONTHLY_STOP_LOSS = -0.10   # -10% do capital alocado em B → pausar B
 
