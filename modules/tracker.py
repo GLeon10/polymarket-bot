@@ -45,8 +45,8 @@ _POLY_BASE = "https://polymarket.com/event"
 
 _SIGNALS_HEADER = [
     "timestamp", "module", "market_id", "question", "url",
-    "side", "entry_price", "edge", "size_usd", "shares", "closes_at",
-    "n_markets",
+    "side", "entry_price", "edge", "size_usd", "shares", "pnl_est_usd",
+    "closes_at", "n_markets",
 ]
 _RESOLVED_HEADER = [
     "market_id", "question", "module", "side",
@@ -127,6 +127,10 @@ def record_signal(module: str, market_id: str, question: str,
     size   = _trade_size(module)
     shares = round(size / entry_price, 4) if entry_price > 0 else 0
 
+    # Estimated P&L: arb modules lock in the edge; directional wins if side hits
+    _is_arb = module in ("A", "CORR") or "+" in side
+    pnl_est = round(size * edge, 4) if _is_arb else round(shares * (1.0 - entry_price), 4)
+
     url = f"{_POLY_BASE}/{market_slug}" if market_slug else ""
 
     row = {
@@ -140,6 +144,7 @@ def record_signal(module: str, market_id: str, question: str,
         "edge":        round(edge, 4),
         "size_usd":    round(size, 2),
         "shares":      shares,
+        "pnl_est_usd": pnl_est,
         "closes_at":   _to_brt(closes_at_iso),
         "n_markets":   n_markets,
     }
@@ -207,12 +212,15 @@ def check_resolutions():
         edge          = float(signal.get("edge", 0))
         module        = signal["module"]
 
-        if module == "A":
-            # edge já é o retorno real sobre o capital investido
+        # Arbitrage trades (A, CORR, or any side with "+" like "Yes+No"):
+        # the edge is locked in regardless of which outcome wins.
+        # Directional trades: win if resolution matches the traded side.
+        is_arb = module in ("A", "CORR") or "+" in side
+        if is_arb:
             pnl = round(size_usd * edge, 4)
         else:
-            # Direcional: ganha se acertou o lado, perde se errou
-            if resolution == side:
+            # Normalise: signal side may be "Yes" or "No"; resolution is "yes"/"no"
+            if resolution == side.lower():
                 pnl = round(shares * (1.0 - entry_price), 4)
             else:
                 pnl = round(-size_usd, 4)
