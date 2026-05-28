@@ -298,12 +298,6 @@ def print_summary():
     b1_capital = banca_b * _cfg.BANCA_B_ALLOC_B1
     b2_capital = banca_b * _cfg.BANCA_B_ALLOC_B2
 
-    capital_map = {
-        "A":  (_cfg.CAPITAL_A, min(50.0, _cfg.CAPITAL_A * 0.10)),
-        "B1": (b1_capital, min(_cfg.MAX_TRADE_B_USD, b1_capital) if b1_capital > 0 else _cfg.MAX_TRADE_B_USD),
-        "B2": (b2_capital, min(_cfg.MAX_TRADE_B_USD, b2_capital) if b2_capital > 0 else _cfg.MAX_TRADE_B_USD),
-    }
-
     logger.info("=" * 60)
     logger.info("RESUMO DRY-RUN | %s | FASE %d", _now_brt(), phase)
     logger.info("  Capital total: $%.0f | A: $%.0f | Reserva: $%.0f",
@@ -313,8 +307,8 @@ def print_summary():
         logger.info("  Banca B: $%.2f%s | B1: $%.2f | B2: $%.2f",
                     banca_b, paused, b1_capital, b2_capital)
     else:
-        a_pnl   = get_module_pnl("A")
-        faltam  = max(0.0, _cfg.PHASE2_TRIGGER_USD - a_pnl)
+        a_pnl  = get_module_pnl("A")
+        faltam = max(0.0, _cfg.PHASE2_TRIGGER_USD - a_pnl)
         logger.info("  Fase 2 ativa quando A acumular $%.0f | A P&L atual: $%.2f | Faltam: $%.2f",
                     _cfg.PHASE2_TRIGGER_USD, a_pnl, faltam)
     logger.info("  Sinais: %d total | %d resolvidos | %d em aberto",
@@ -324,17 +318,29 @@ def print_summary():
     total_pnl      = 0.0
     total_deployed = 0.0
 
-    for mod in ("A", "B1", "B2"):
-        capital_alocado, por_op = capital_map[mod]
+    # Ordered display: canonical modules first, then any others found in data
+    canonical = ["A", "B1", "B2", "B3", "B4", "B5", "B5_ARB", "B5_NEAR_RES", "B5_REPRICING", "CORR"]
+    seen = set()
+    all_mods = []
+    for m in canonical:
+        if m in signals_by_module or m in resolved_by_module:
+            all_mods.append(m)
+            seen.add(m)
+    for m in list(signals_by_module) + list(resolved_by_module):
+        if m not in seen:
+            all_mods.append(m)
+            seen.add(m)
+
+    for mod in all_mods:
+        por_op   = _trade_size(mod)
         pnls     = resolved_by_module.get(mod, [])
         n_sinais = len(signals_by_module.get(mod, []))
         deployed = n_sinais * por_op
 
         if not pnls:
             logger.info(
-                "  Módulo %-2s | capital $%.2f | por op $%.2f | "
-                "%d sinal(is) | sem resoluções ainda",
-                mod, capital_alocado, por_op, n_sinais,
+                "  Módulo %-12s | por op $%.2f | %d sinal(is) | sem resoluções ainda",
+                mod, por_op, n_sinais,
             )
             total_deployed += deployed
             continue
@@ -345,10 +351,8 @@ def print_summary():
         roi      = (mod_pnl / deployed * 100) if deployed > 0 else 0.0
 
         logger.info(
-            "  Módulo %-2s | capital $%.2f | por op $%.2f | "
-            "%d op(s) | %d ganhos (%.0f%%) | P&L $%.2f | ROI %.1f%%",
-            mod, capital_alocado, por_op,
-            len(pnls), wins, win_rate, mod_pnl, roi,
+            "  Módulo %-12s | por op $%.2f | %d op(s) | %d ganhos (%.0f%%) | P&L $%.2f | ROI %.1f%%",
+            mod, por_op, len(pnls), wins, win_rate, mod_pnl, roi,
         )
         total_pnl      += mod_pnl
         total_deployed += deployed
