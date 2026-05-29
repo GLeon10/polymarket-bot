@@ -54,7 +54,7 @@ A_MIN_SPREAD          = 0.02   # retorno mínimo base (2%) para trades de 2 merc
 A_SPREAD_PER_MARKET   = 0.005  # 0.5% adicional por mercado (bid-ask + slippage sequencial)
 A_MAX_FEE             = 0.025  # fee máxima aceita por mercado (2.5%) — padrão Polymarket é 2%
 A_MIN_LIQUIDITY       = 100.0  # $100 mínimo no order book de cada lado
-A_MAX_RESOLUTION_DAYS = 60     # mercados que resolvem em ≤ 60 dias
+A_MAX_RESOLUTION_DAYS = 90     # mercados que resolvem em ≤ 90 dias
 A_TRADE_SIZE_USD      = 50.0   # 10% do capital total ($50 com $500)
 A_SCAN_INTERVAL       = 600    # segundos (10 min)
 
@@ -67,7 +67,7 @@ CORR_MIN_LIQUIDITY   = 100.0
 A_TARGET_TAGS        = {"Geopolitics", "World"}
 
 # ── Módulo B1 — Weather Oracle ───────────────────────────────────────────────
-B1_MIN_DIVERGENCE    = 0.12   # 12% divergência modelo vs. mercado
+B1_MIN_DIVERGENCE    = 0.08   # 8% divergência modelo vs. mercado
 B1_MAX_SHARE_PRICE   = 0.40   # ≤ 40¢ para reduzir fee efetiva
 B1_MIN_LIQUIDITY     = 100.0
 B1_MAX_RESOLUTION_H  = 24     # apenas mercados que resolvem em ≤ 24h
@@ -95,7 +95,7 @@ B1_CITIES = {
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 # ── Módulo B2 — Esports Oracle ───────────────────────────────────────────────
-B2_MIN_DIVERGENCE    = 0.10   # 10% divergência win-rate vs. mercado (era 15%, reduzido para coleta de dados)
+B2_MIN_DIVERGENCE    = 0.09   # 9% divergência win-rate vs. mercado
 B2_MAX_SHARE_PRICE   = 0.40
 B2_MIN_LIQUIDITY     = 100.0
 B2_MAX_RESOLUTION_H  = 4      # partidas que resolvem em ≤ 4h
@@ -164,7 +164,7 @@ B2_MIN_MATCHES     = int(os.getenv("B2_MIN_MATCHES", "5"))
 STRATEGY_B5_ENABLED: bool = os.getenv("STRATEGY_B5_ENABLED", "true").lower() == "true"
 B5_ASSETS         = ["BTC", "ETH", "SOL"]
 B5_TRADE_SIZE_USD = 25.0      # por lado ($50 total)
-B5_THRESHOLD      = 0.982     # p_up + p_down + fee_total < B5_THRESHOLD
+B5_THRESHOLD      = 0.985     # p_up + p_down + fee_total < B5_THRESHOLD
 B5_FEE_RATE       = 0.072     # taker fee crypto Polymarket: fee = rate × p × (1−p)
 B5_T_ENTRY_MIN_S  = 30        # segundos após abertura do candle: início da janela
 B5_T_ENTRY_MAX_S  = 240       # segundos após abertura do candle: fim da janela
@@ -181,7 +181,7 @@ B5_NEAR_RES_MIN_EDGE       = 0.005   # edge mínimo após fee (0.5%)
 B5_NEAR_RES_WINDOW_START_S = 60      # T-60s antes do fechamento
 B5_NEAR_RES_WINDOW_END_S   = 10      # T-10s antes do fechamento
 # REPRICING
-B5_REPRICING_MIN_DIVERGENCE = 0.06   # divergência mínima fair vs. poly
+B5_REPRICING_MIN_DIVERGENCE = 0.05   # divergência mínima fair vs. poly
 B5_REPRICING_MIN_LIQUIDITY  = 150.0  # liquidez mínima no lado a comprar
 B5_REPRICING_VOL_CANDLES    = 20     # janela rolante de retornos para vol
 
