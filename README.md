@@ -105,6 +105,7 @@ Todo sinal passa por 4 filtros de qualidade: fee, liquidez, exaustividade e cons
 ```
 polymarket_bot/
 ├── main.py                  # Orquestrador — inicia threads dos módulos
+├── simulate.py              # Simulação manual de um ciclo completo (dev)
 ├── config/
 │   └── config.py            # Todos os parâmetros e thresholds
 ├── modules/
@@ -127,8 +128,8 @@ polymarket_bot/
 │   └── test_all.py          # 264 testes (todos os módulos)
 └── data/
     ├── trades/
-    │   ├── signals.csv      # Sinais emitidos
-    │   └── resolved.csv     # Sinais resolvidos com P&L
+    │   ├── signals.csv      # Sinais emitidos (inclui pnl_est_usd por sinal)
+    │   └── resolved.csv     # Sinais resolvidos com P&L real
     └── logs/
         ├── YYYY-MM-DD.log   # Log unificado do dia
         ├── scanner_a.log    # Log individual por módulo

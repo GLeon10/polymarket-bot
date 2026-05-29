@@ -1,5 +1,5 @@
 """
-Orquestrador principal — roda os 3 módulos em paralelo com seus intervalos.
+Orquestrador principal — roda os 8 módulos em paralelo com seus intervalos.
 """
 
 import logging
