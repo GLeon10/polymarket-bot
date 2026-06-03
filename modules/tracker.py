@@ -128,7 +128,8 @@ def record_signal(module: str, market_id: str, question: str,
     shares = round(size / entry_price, 4) if entry_price > 0 else 0
 
     # Estimated P&L: arb modules lock in the edge; directional wins if side hits
-    _is_arb = module in ("A", "CORR") or "+" in side
+    # "arb-t*" covers B3 arb patterns; "+" covers B5 Yes+No
+    _is_arb = module in ("A", "CORR") or "+" in side or side.lower().startswith("arb")
     pnl_est = round(size * edge, 4) if _is_arb else round(shares * (1.0 - entry_price), 4)
 
     url = f"{_POLY_BASE}/{market_slug}" if market_slug else ""
@@ -214,8 +215,8 @@ def check_resolutions():
 
         # Arbitrage trades (A, CORR, or any side with "+" like "Yes+No"):
         # the edge is locked in regardless of which outcome wins.
-        # Directional trades: win if resolution matches the traded side.
-        is_arb = module in ("A", "CORR") or "+" in side
+        # "arb-t*" covers B3 arb patterns. Directional trades use resolution match.
+        is_arb = module in ("A", "CORR") or "+" in side or side.startswith("arb")
         if is_arb:
             pnl = round(size_usd * edge, 4)
         else:

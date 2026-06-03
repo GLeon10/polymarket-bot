@@ -314,8 +314,10 @@ _RES_DIFF = "This market will resolve YES based on Reuters wire reports."
 
 class TestScannerA:
     @staticmethod
-    def _market(question, yes_price, condition_id=None, slug=None,
-                end_date="2026-06-01T00:00:00Z"):
+    def _market(question, yes_price, condition_id=None, slug=None, end_date=None):
+        from datetime import datetime, timedelta, timezone as _tz
+        if end_date is None:
+            end_date = (datetime.now(_tz.utc) + timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
         cid = condition_id or question[:8].lower().replace(" ", "-")
         return {
             "condition_id": cid, "question": question,
