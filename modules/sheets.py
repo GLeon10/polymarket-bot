@@ -28,13 +28,13 @@ _spreadsheet = None  # gspread.Spreadsheet
 
 _SIGNALS_HEADER = [
     "timestamp", "module", "market_id", "question", "url",
-    "side", "entry_price", "edge", "size_usd", "shares", "pnl_est_usd",
+    "side", "entry_price", "edge", "spread", "size_usd", "shares", "pnl_est_usd",
     "closes_at", "n_markets",
 ]
 _RESOLVED_HEADER = [
     "market_id", "question", "module", "side",
     "entry_price", "size_usd", "shares",
-    "resolution", "pnl_usd", "result", "resolved_at",
+    "resolution", "pnl_usd", "result", "edge", "spread", "resolved_at",
 ]
 
 

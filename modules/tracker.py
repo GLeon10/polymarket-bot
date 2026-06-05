@@ -45,7 +45,7 @@ _POLY_BASE = "https://polymarket.com/event"
 
 _SIGNALS_HEADER = [
     "timestamp", "module", "market_id", "question", "url",
-    "side", "entry_price", "edge", "size_usd", "shares", "pnl_est_usd",
+    "side", "entry_price", "edge", "spread", "size_usd", "shares", "pnl_est_usd",
     "closes_at", "n_markets",
 ]
 _RESOLVED_HEADER = [
@@ -54,8 +54,13 @@ _RESOLVED_HEADER = [
     "resolution",       # "yes" | "no"
     "pnl_usd",
     "result",           # "WIN" | "LOSS"
+    "edge", "spread",
     "resolved_at",
 ]
+
+
+def _fmt_spread(edge: float) -> str:
+    return f"{edge:.4f} ({edge * 100:g}% de spread)"
 
 def _banca_b() -> float:
     """Lê o valor da banca B do phase.json (evita import circular com phase_manager)."""
@@ -144,6 +149,7 @@ def record_signal(module: str, market_id: str, question: str,
         "side":        side,
         "entry_price": round(entry_price, 4),
         "edge":        round(edge, 4),
+        "spread":      _fmt_spread(edge),
         "size_usd":    round(size, 2),
         "shares":      shares,
         "pnl_est_usd": pnl_est,
@@ -238,6 +244,8 @@ def check_resolutions():
             "resolution":  resolution,
             "pnl_usd":     pnl,
             "result":      "WIN" if pnl > 0 else "LOSS",
+            "edge":        round(edge, 4),
+            "spread":      _fmt_spread(edge),
             "resolved_at": _now_brt(),
         }
         _append(_RESOLVED_PATH, _RESOLVED_HEADER, row)
