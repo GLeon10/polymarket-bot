@@ -96,9 +96,11 @@ def _get_or_create_ws(tab_name: str, header: list[str]):
             logger.info("Sheets: aba '%s' criada com cabeçalho", tab_name)
             return ws
 
-        # Garante cabeçalho caso a aba exista mas esteja vazia
-        if not ws.row_values(1):
-            ws.append_row(header, value_input_option="RAW")
+        # Sync header: write if missing or outdated
+        existing = ws.row_values(1)
+        if existing != header:
+            ws.update("A1", [header])
+            logger.info("Sheets: cabeçalho da aba '%s' atualizado", tab_name)
 
         return ws
     except Exception as e:
