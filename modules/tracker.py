@@ -53,6 +53,7 @@ _RESOLVED_HEADER = [
     "entry_price", "size_usd", "shares",
     "resolution",       # "yes" | "no"
     "pnl_usd",
+    "result",           # "WIN" | "LOSS"
     "resolved_at",
 ]
 
@@ -236,6 +237,7 @@ def check_resolutions():
             "shares":      signal["shares"],
             "resolution":  resolution,
             "pnl_usd":     pnl,
+            "result":      "WIN" if pnl > 0 else "LOSS",
             "resolved_at": _now_brt(),
         }
         _append(_RESOLVED_PATH, _RESOLVED_HEADER, row)
