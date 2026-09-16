@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from config import config
-from modules import clob_utils, tracker
+from modules import arb, book, clob_utils, executor, fees, tracker
 
 logger = logging.getLogger("oracle_b4")
 
@@ -70,6 +70,15 @@ class SportsSignal:
     found_at:         datetime = field(default_factory=datetime.utcnow)
     end_date:         str | None = None
     slug_ml:          str | None = None
+    # Preços varridos do livro para o tamanho real da ordem, e os tokens das
+    # duas pernas. `spread_margin` passa a ser o retorno LÍQUIDO da cesta.
+    exec_ml:          float = 0.0
+    exec_spread:      float = 0.0
+    token_ml:         str = ""
+    token_spread:     str = ""
+    fee_ml:           float = 0.0
+    fee_spread:       float = 0.0
+    budget_usd:       float = 0.0
 
 
 # ── Utilitários de mercado ────────────────────────────────────────────────────
@@ -198,6 +207,32 @@ def _detect_ml_spread(candidates: list[dict]) -> list[SportsSignal]:
         if liq < config.B4_MIN_LIQUIDITY:
             continue
 
+        # A cesta e: YES no moneyline + NO no spread. Em qualquer resultado ela
+        # paga no minimo 1 share:
+        #   vence por margem  -> ML paga 1, NO-spread paga 0  = 1
+        #   vence sem margem  -> ML paga 1, NO-spread paga 1  = 2
+        #   perde             -> ML paga 0, NO-spread paga 1  = 1
+        # Logo o arb e real desde que o custo all-in fique abaixo de 1.
+        budget      = tracker.trade_budget("B4")
+        exec_ml     = book.executable_ask(yes_tok["token_id"], budget / 2)
+        exec_spread = book.executable_ask(no_tok["token_id"],  budget / 2)
+        if not (0 < exec_ml < 1) or not (0 < exec_spread < 1):
+            continue
+
+        # Taxa propria de cada mercado — usar a taxa de crypto (7.2%) aqui
+        # inventaria um custo que mercados de esporte nao cobram.
+        rate_ml     = arb.market_fee_rate(m_ml)
+        rate_spread = arb.market_fee_rate(m_spread)
+        cost_per_share = (fees.effective_price(exec_ml, rate_ml)
+                          + fees.effective_price(exec_spread, rate_spread))
+        net_edge       = (1.0 - cost_per_share) / cost_per_share if cost_per_share > 0 else 0.0
+        if net_edge < config.B4_MIN_SPREAD:
+            logger.debug(
+                "B4 descartado: edge real %.2f%% < minimo %.2f%% (mid sugeria %.2f%%)",
+                net_edge * 100, config.B4_MIN_SPREAD * 100, violation * 100,
+            )
+            continue
+
         league = _detect_league(m_spread)
         signals.append(SportsSignal(
             market_id_ml     = m_ml["condition_id"],
@@ -207,9 +242,16 @@ def _detect_ml_spread(candidates: list[dict]) -> list[SportsSignal]:
             team_a           = ta,
             team_b           = tb,
             league           = league,
-            price_ml         = p_ml,
-            price_spread     = p_spread,
-            spread_margin    = violation,
+            price_ml         = round(exec_ml, 4),
+            price_spread     = round(exec_spread, 4),
+            spread_margin    = round(net_edge, 4),
+            exec_ml          = round(exec_ml, 4),
+            exec_spread      = round(exec_spread, 4),
+            token_ml         = yes_tok["token_id"],
+            token_spread     = no_tok["token_id"],
+            fee_ml           = rate_ml,
+            fee_spread       = rate_spread,
+            budget_usd       = budget,
             side             = "Yes ML + No spread",
             liquidity        = liq,
             found_at         = datetime.utcnow(),
@@ -254,19 +296,38 @@ def scan() -> list[SportsSignal]:
 # ── Execução (dry-run) ────────────────────────────────────────────────────────
 
 def execute(signal: SportsSignal, client) -> bool:
-    if config.MODE == "dry_run":
-        logger.info(
-            "[DRY-RUN] B4: %s vs %s | %s | viol=%.1f%%",
-            signal.team_a, signal.team_b, signal.league,
-            signal.spread_margin * 100,
+    budget = signal.budget_usd or tracker.trade_budget("B4")
+    legs   = tracker.build_legs(
+        [
+            (signal.market_id_ml,     "Yes", signal.exec_ml,     signal.token_ml,     signal.fee_ml),
+            (signal.market_id_spread, "No",  signal.exec_spread, signal.token_spread, signal.fee_spread),
+        ],
+        budget,
+    )
+    if len(legs) != 2:
+        logger.warning("B4: cesta incompleta — não registrado (%s)", signal.market_id_ml)
+        return False
+
+    registered = tracker.record_signal(
+        "B4", signal.market_id_ml,
+        f"{signal.question_ml} | spread: {signal.question_spread[:40]}",
+        signal.side, signal.exec_ml, signal.spread_margin,
+        closes_at_iso=signal.end_date,
+        market_slug=signal.slug_ml,
+        n_markets=2,
+        legs=legs,
+    )
+    if not registered:
+        return False
+
+    if executor.live_enabled("B4"):
+        return executor.execute_basket(
+            client, "B4", signal.market_id_ml, legs, min_payout_per_share=1.0,
         )
-        tracker.record_signal(
-            "B4", signal.market_id_ml,
-            f"{signal.question_ml} | spread: {signal.question_spread[:40]}",
-            signal.side, signal.price_ml, signal.spread_margin,
-            closes_at_iso=signal.end_date,
-            market_slug=signal.slug_ml,
-        )
-        return True
-    logger.warning("Execução live não implementada: %s", signal.market_id_ml)
-    return False
+
+    logger.info(
+        "[DRY-RUN] B4: %s vs %s | %s | ML=%.3f NO-spread=%.3f | edge_liq=%.2f%%",
+        signal.team_a, signal.team_b, signal.league,
+        signal.exec_ml, signal.exec_spread, signal.spread_margin * 100,
+    )
+    return True

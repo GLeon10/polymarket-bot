@@ -9,9 +9,16 @@ Configuração no .env:
 Se não configurado, o módulo é silenciosamente ignorado.
 Erros de conexão não interrompem o bot — são apenas logados como WARNING.
 
-Abas criadas automaticamente:
-  "Signals"  — espelho de data/trades/signals.csv
-  "Resolved" — espelho de data/trades/resolved.csv
+Abas:
+  "Signals"     — espelho de data/trades/signals.csv (esquema por pernas)
+  "Resolved"    — espelho de data/trades/resolved.csv (P&L real por perna)
+  "Signals_v1"  — arquivo morto: registros da contabilidade antiga
+  "Resolved_v1" — idem
+
+As abas _v1 guardam o que foi gravado enquanto o P&L de arbitragem era
+`size_usd × edge`, sem olhar a resolução — por isso 38 de 38 operações
+aparecem lá como WIN. Elas ficam intactas para consulta, e o bot não escreve
+mais nelas. `rotate_sheets.py` faz esse arquivamento.
 """
 
 import logging
@@ -26,15 +33,17 @@ _lock     = threading.Lock()
 _gc       = None   # gspread.Client   (inicializado uma vez)
 _spreadsheet = None  # gspread.Spreadsheet
 
+# Espelham exatamente modules/tracker.py — mudou lá, muda aqui.
 _SIGNALS_HEADER = [
-    "timestamp", "module", "market_id", "question", "url",
+    "signal_id", "timestamp", "module", "market_id", "question", "url",
     "side", "entry_price", "edge", "spread", "size_usd", "shares", "pnl_est_usd",
-    "closes_at", "n_markets",
+    "cost_usd", "fee_usd", "legs_json", "closes_at", "n_markets",
 ]
 _RESOLVED_HEADER = [
-    "market_id", "question", "module", "side",
+    "signal_id", "market_id", "question", "module", "side",
     "entry_price", "size_usd", "shares",
-    "resolution", "pnl_usd", "result", "edge", "spread", "resolved_at",
+    "resolution", "cost_usd", "fee_usd", "payout_usd", "pnl_usd", "roi_pct",
+    "result", "edge", "spread", "edge_realizado", "resolved_at",
 ]
 
 
@@ -96,13 +105,29 @@ def _get_or_create_ws(tab_name: str, header: list[str]):
             logger.info("Sheets: aba '%s' criada com cabeçalho", tab_name)
             return ws
 
-        # Sync header: write if missing or outdated
         existing = ws.row_values(1)
-        if existing != header:
+        if existing == header:
+            return ws
+
+        # Aba vazia (ou só com cabeçalho): pode reescrever sem perder nada.
+        tem_dados = len([r for r in ws.get_all_values()[1:] if any(c.strip() for c in r)]) > 0
+        if not tem_dados:
             ws.update("A1", [header])
             logger.info("Sheets: cabeçalho da aba '%s' atualizado", tab_name)
+            return ws
 
-        return ws
+        # Aba COM dados e cabeçalho diferente: recusar.
+        #
+        # Reescrever o cabeçalho aqui manteria as linhas antigas no lugar mas
+        # passaria a anexar as novas na ordem de colunas nova — os dados
+        # ficariam deslocados coluna a coluna, sem erro visível. É o mesmo
+        # risco que o tracker já barra nos CSVs.
+        logger.error(
+            "Sheets: aba '%s' tem %d colunas e o esquema atual tem %d, com dados dentro. "
+            "Nada será gravado. Rode: python rotate_sheets.py",
+            tab_name, len(existing), len(header),
+        )
+        return None
     except Exception as e:
         logger.warning("Sheets: erro ao acessar aba '%s' — %s", tab_name, e)
         return None

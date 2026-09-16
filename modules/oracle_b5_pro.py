@@ -3,12 +3,21 @@ Módulo B5 Pro — Crypto 5-Min Multi-Strategy (BTC / ETH / SOL)
 
 Três estratégias rodando em paralelo sobre mercados binários de 5 minutos:
 
-  ARB       — Arbitragem pura: p_up + p_down + fee < 0.982 (T+30s..T+240s)
-              FAK separados por lado para eliminar risco de leg parcial.
-  NEAR_RES  — Near-resolution: lado com preço em [0.96, 0.995] nos últimos
-              60s do candle. Edge mínimo: 0.5%. Flag TAIL_RISK no Telegram.
-  REPRICING — Fair value via Binance aggTrade: |fair_prob − poly| > 6%.
-              Volatilidade estimada em janela rolante de 20 candles.
+  ARB       — Arbitragem pura YES+NO, com preco VWAP e profundidade minima.
+              Ordens FOK por perna (modules/executor.py). ATIVA.
+
+  NEAR_RES  — DESLIGADA (B5_NEAR_RES_ENABLED=false). Comprar a 0.96-0.995 por
+              0.5% de edge e EV~0 por construcao: o preco JA e a estimativa de
+              probabilidade do mercado, e ainda se paga o ask e o fee. A
+              distribuicao e +2% em 98% dos casos contra -98% em 2% — uma perda
+              apaga ~50 ganhos, e as perdas chegam correlacionadas entre
+              BTC/ETH/SOL. Kelly = 0.
+
+  REPRICING — DESLIGADA (B5_REPRICING_ENABLED=false). O modelo de fair value
+              foi corrigido (vol escalada por sqrt(tempo restante); abertura de
+              candle so e usada quando confiavel), mas continua competindo em
+              latencia com HFT e inferindo o strike em vez de le-lo. So religar
+              contra P&L resolvido positivo em dry-run.
 
 Fontes de dados:
   - WebSocket CLOB Polymarket → ask prices em tempo real
@@ -49,7 +58,7 @@ except ImportError:
     _HAS_SCIPY = False
 
 from config import config
-from modules import clob_utils, tracker
+from modules import book, clob_utils, executor, fees, tracker
 
 logger = logging.getLogger("oracle_b5_pro")
 
@@ -83,6 +92,12 @@ class B5ProSignal:
     latency_ms:  float | None = None
     tail_risk:   bool = False
     found_at:    datetime = field(default_factory=datetime.utcnow)
+    # Pernas: ARB compra os dois lados; direcional usa só o token do seu lado.
+    yes_price:   float = 0.0
+    no_price:    float = 0.0
+    yes_token:   str = ""
+    no_token:    str = ""
+    token_id:    str = ""
 
 
 # ── Estado global (thread-safe) ───────────────────────────────────────────────
@@ -122,12 +137,31 @@ _loop_ctrl    = threading.Lock()
 # ── Fórmulas ──────────────────────────────────────────────────────────────────
 
 def _fee(p: float) -> float:
-    """Taker fee B5: B5_FEE_RATE × p × (1−p)."""
-    return config.B5_FEE_RATE * p * (1.0 - p)
+    """Taker fee por share — delega para modules/fees.py (modelo min(p, 1−p))."""
+    return fees.fee_per_share(p, config.B5_FEE_RATE)
 
 
 def _total_cost(p_up: float, p_down: float) -> float:
-    return p_up + p_down + _fee(p_up) + _fee(p_down)
+    """Custo all-in de 1 par YES+NO, que paga $1 na resolução."""
+    return fees.binary_arb_cost(p_up, p_down, config.B5_FEE_RATE)
+
+
+def _net_edge(p_up: float, p_down: float) -> float:
+    cost = _total_cost(p_up, p_down)
+    return (1.0 - cost) / cost if cost > 0 else 0.0
+
+
+def _active_detectors() -> tuple:
+    """
+    Detectores habilitados. NEAR_RES e REPRICING saem desligados de fábrica —
+    ver a justificativa em config.py e docs/ESTRATEGIAS.md.
+    """
+    dets = [_detect_arb]
+    if config.B5_NEAR_RES_ENABLED:
+        dets.append(_detect_near_res)
+    if config.B5_REPRICING_ENABLED:
+        dets.append(_detect_repricing)
+    return tuple(dets)
 
 
 # ── Janelas de tempo ──────────────────────────────────────────────────────────
@@ -192,13 +226,7 @@ def _get_clob_ask(token_id: str) -> float:
 def _rest_ask(token_id: str) -> float:
     """Fallback REST: melhor ask do order book."""
     try:
-        resp = requests.get(
-            f"{config.CLOB_BASE_URL}/book",
-            params={"token_id": token_id},
-            timeout=5,
-        )
-        asks = resp.json().get("asks", [])
-        return float(asks[0]["price"]) if asks else 0.0
+        return book.best_ask(token_id)
     except Exception:
         return 0.0
 
@@ -218,9 +246,17 @@ def _binance_spot(asset: str) -> float | None:
 
 
 def _binance_open(asset: str) -> float | None:
+    """
+    Preco de abertura do candle atual — que e o strike do mercado.
+
+    Retorna None quando a abertura nao e confiavel (conexao iniciada no meio
+    do candle): sem o strike correto, todo o calculo de fair value e lixo.
+    """
     with _binance_lock:
         d = _binance_price.get(asset)
-    return d["open"] if d else None
+    if not d or not d.get("trusted", False):
+        return None
+    return d["open"]
 
 
 def _binance_ts(asset: str) -> float | None:
@@ -323,16 +359,32 @@ def _detect_arb(mid: str, info: dict) -> B5ProSignal | None:
         if key in _executed:
             return None
 
-    p_up   = _ask(info["yes_id"])
-    p_down = _ask(info["no_id"])
-    if p_up <= 0 or p_down <= 0:
+    # Triagem pelo WS (só melhor ask, sem tamanho)
+    p_ws_up   = _ask(info["yes_id"])
+    p_ws_down = _ask(info["no_id"])
+    if p_ws_up <= 0 or p_ws_down <= 0:
+        return None
+    if _net_edge(p_ws_up, p_ws_down) <= 0:
         return None
 
-    cost = _total_cost(p_up, p_down)
-    if cost >= config.B5_THRESHOLD:
+    # Confirmação no livro: preço médio real para o tamanho, com profundidade
+    size   = tracker.trade_budget("B5_ARB")
+    p_up   = book.executable_ask(info["yes_id"], size / 2)
+    p_down = book.executable_ask(info["no_id"],  size / 2)
+    if not (0 < p_up < 1) or not (0 < p_down < 1):
         return None
 
-    edge  = round(1.0 - cost, 4)
+    depth = min(
+        clob_utils.get_orderbook_liquidity(info["yes_id"]),
+        clob_utils.get_orderbook_liquidity(info["no_id"]),
+    )
+    if depth < config.B5_MIN_DEPTH_USD:
+        return None
+
+    edge = round(_net_edge(p_up, p_down), 4)
+    if edge < config.B5_MIN_NET_EDGE:
+        return None
+
     asset = _detect_asset(info["question"])
 
     logger.info(
@@ -350,6 +402,10 @@ def _detect_arb(mid: str, info: dict) -> B5ProSignal | None:
         size_usd    = config.B5_TRADE_SIZE_USD,
         end_time    = info["end_time"],
         slug        = info["slug"],
+        yes_price   = round(p_up, 4),
+        no_price    = round(p_down, 4),
+        yes_token   = info["yes_id"],
+        no_token    = info["no_id"],
     )
 
 
@@ -390,6 +446,7 @@ def _detect_near_res(mid: str, info: dict) -> B5ProSignal | None:
             asset       = asset,
             side        = outcome,
             entry_price = round(p, 4),
+            token_id    = tid,
             edge        = edge,
             size_usd    = config.B5_TRADE_SIZE_USD,
             end_time    = info["end_time"],
@@ -425,8 +482,28 @@ def _detect_repricing(mid: str, info: dict) -> B5ProSignal | None:
     if vol is None or vol <= 0:
         return None
 
+    # A vol da janela é o desvio de retornos de candles INTEIROS. Usá-la para
+    # normalizar um movimento PARCIAL era o erro central deste detector: no
+    # meio do candle só resta parte da variância, então o denominador correto é
+    #
+    #     sigma_restante = sigma_candle × sqrt(tempo_restante / duração)
+    #
+    # Com a vol cheia o |z| saía pequeno demais e fair_prob era sempre puxado
+    # na direção de 0.50. Na prática isso fazia o bot olhar para o lado que
+    # estava ganhando, achá-lo "caro", e comprar o lado perdedor — com um
+    # "edge" que crescia justamente conforme o candle avançava e o mercado
+    # ficava mais certo.
+    secs_left = (info["end_time"] - datetime.now(timezone.utc)).total_seconds()
+    if secs_left <= config.B5_REPRICING_MIN_SECS_LEFT:
+        return None
+
+    frac_left  = max(secs_left / config.B5_CANDLE_SECS, 1e-6)
+    vol_left   = vol * math.sqrt(min(frac_left, 1.0))
+    if vol_left <= 0:
+        return None
+
     pct_change = (spot - open_p) / open_p
-    z_score    = pct_change / vol
+    z_score    = pct_change / vol_left
     fair_prob  = float(_norm.cdf(z_score))
 
     yes_ask = _ask(info["yes_id"])
@@ -564,8 +641,8 @@ async def _ws_binance(stop: threading.Event) -> None:
     url     = f"{_BINANCE_WS_URL}/{streams}"
     backoff = 5
 
-    # asset → (candle_bucket_id, open_price)
-    _candle_open: dict[str, tuple[int, float]] = {}
+    # asset -> (candle_bucket_id, open_price, abertura_confiavel)
+    _candle_open: dict[str, tuple[int, float, bool]] = {}
 
     while not stop.is_set():
         try:
@@ -597,21 +674,30 @@ async def _ws_binance(stop: threading.Event) -> None:
                         bucket = int(ts // 300)
                         prev   = _candle_open.get(asset)
 
-                        if prev is None or prev[0] != bucket:
-                            # Novo candle: guarda retorno do anterior para vol
-                            if prev is not None:
+                        if prev is None:
+                            # Primeira mensagem da conexão. Este preço é o do
+                            # momento em que conectamos, não a abertura do
+                            # candle — e a abertura é o STRIKE do mercado.
+                            # Marcar como não-confiável evita medir pct_change
+                            # a partir de uma base errada pelo resto do candle,
+                            # e evita contaminar a janela de volatilidade com um
+                            # retorno parcial que não é retorno de candle.
+                            _candle_open[asset] = (bucket, p, False)
+                        elif prev[0] != bucket:
+                            if prev[2]:   # só candles inteiros entram na vol
                                 ret = (p - prev[1]) / prev[1]
                                 with _vol_lock:
                                     _vol_window[asset].append(ret)
-                            _candle_open[asset] = (bucket, p)
+                            _candle_open[asset] = (bucket, p, True)
 
-                        open_p = _candle_open[asset][1]
+                        _, open_p, trusted = _candle_open[asset]
 
                         with _binance_lock:
                             _binance_price[asset] = {
-                                "price": p,
-                                "open":  open_p,
-                                "ts":    ts,
+                                "price":   p,
+                                "open":    open_p,
+                                "ts":      ts,
+                                "trusted": trusted,
                             }
 
                     except (json.JSONDecodeError, TypeError, ValueError, KeyError):
@@ -661,7 +747,7 @@ async def _main_loop(stop: threading.Event, started: threading.Event) -> None:
             snapshot = dict(_watched)
 
         for mid, info in snapshot.items():
-            for detector in (_detect_arb, _detect_near_res, _detect_repricing):
+            for detector in _active_detectors():
                 try:
                     sig = detector(mid, info)
                     if sig is not None:
@@ -739,43 +825,67 @@ def execute(signal: B5ProSignal, client) -> bool:
             return False
         _executed.add(key)
 
-    if config.MODE == "dry_run":
-        tail_tag = " ⚠️ TAIL_RISK" if signal.tail_risk else ""
-        extra = ""
-        if signal.strategy == "REPRICING" and signal.fair_prob is not None:
-            extra = (
-                f" | fair={signal.fair_prob:.3f} poly={signal.poly_price:.3f}"
-                + (f" lat={signal.latency_ms:.0f}ms" if signal.latency_ms else "")
+    tail_tag = " ⚠️ TAIL_RISK" if signal.tail_risk else ""
+    extra = ""
+    if signal.strategy == "REPRICING" and signal.fair_prob is not None:
+        extra = (
+            f" | fair={signal.fair_prob:.3f} poly={signal.poly_price:.3f}"
+            + (f" lat={signal.latency_ms:.0f}ms" if signal.latency_ms else "")
+        )
+
+    logger.info(
+        "[DRY-RUN] B5Pro %s | %s | side=%s edge=%.2f%%%s%s",
+        signal.strategy, signal.asset,
+        signal.side, signal.edge * 100, extra, tail_tag,
+    )
+
+    # Questão formatada para Telegram — estratégia, edge e flag de risco visíveis
+    question = (
+        f"[{signal.strategy}]{tail_tag} {signal.asset} "
+        f"edge={signal.edge*100:.1f}%{extra}: {signal.question}"
+    )
+
+    # Módulo encoda a estratégia no CSV/Sheets (ex: "B5_ARB")
+    module    = f"B5_{signal.strategy}"
+    n_markets = 2 if signal.strategy == "ARB" else 1
+
+    if signal.strategy == "ARB":
+        specs = [
+            (signal.market_id, "Yes", signal.yes_price, signal.yes_token),
+            (signal.market_id, "No",  signal.no_price,  signal.no_token),
+        ]
+        budget = signal.size_usd * 2
+    else:
+        specs  = [(signal.market_id, signal.side, signal.entry_price, signal.token_id)]
+        budget = signal.size_usd
+
+    legs = tracker.build_legs(specs, budget, fee_rate=config.B5_FEE_RATE)
+    if not legs:
+        return False
+
+    registered = tracker.record_signal(
+        module,
+        signal.market_id,
+        question[:100],
+        signal.side,
+        signal.entry_price,
+        signal.edge,
+        closes_at_iso = signal.end_time.isoformat(),
+        market_slug   = signal.slug,
+        n_markets     = n_markets,
+        legs          = legs,
+        fee_rate      = config.B5_FEE_RATE,
+    )
+    if not registered:
+        return False
+
+    if executor.live_enabled(module) or executor.live_enabled("B5"):
+        if signal.strategy == "ARB":
+            return executor.execute_basket(
+                client, module, signal.market_id, legs, min_payout_per_share=1.0,
             )
+        return executor.execute_single(client, module, signal.market_id, legs[0])
 
-        logger.info(
-            "[DRY-RUN] B5Pro %s | %s | side=%s edge=%.2f%%%s%s",
-            signal.strategy, signal.asset,
-            signal.side, signal.edge * 100, extra, tail_tag,
-        )
+    return True
 
-        # Questão formatada para Telegram — estratégia, edge e flag de risco visíveis
-        question = (
-            f"[{signal.strategy}]{tail_tag} {signal.asset} "
-            f"edge={signal.edge*100:.1f}%{extra}: {signal.question}"
-        )
-
-        # Módulo encoda a estratégia no CSV/Sheets (ex: "B5_ARB")
-        module   = f"B5_{signal.strategy}"
-        n_markets = 2 if signal.strategy == "ARB" else 1
-
-        tracker.record_signal(
-            module,
-            signal.market_id,
-            question[:100],
-            signal.side,
-            signal.entry_price,
-            signal.edge,
-            closes_at_iso = signal.end_time.isoformat(),
-            market_slug   = signal.slug,
-            n_markets     = n_markets,
-        )
-        return True
-
-    logger.warning("B5Pro: execução live não implementada (%s)", signal.market_id)
-    return False
+    return True

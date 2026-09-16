@@ -13,6 +13,16 @@ POLY_API_PASSPHRASE: str = os.getenv("POLY_API_PASSPHRASE", "")
 
 MODE: str = os.getenv("MODE", "dry_run")  # "dry_run" | "live"
 
+# Módulos autorizados a executar ordens reais quando MODE=live.
+# Tudo que não estiver aqui continua em dry-run mesmo com MODE=live — é o
+# segundo cadeado, para que ligar o modo live não solte os 9 módulos de uma vez.
+LIVE_MODULES: set[str] = {
+    m.strip() for m in os.getenv("LIVE_MODULES", "").split(",") if m.strip()
+}
+
+# Exige confirmação explícita para o primeiro ciclo live (evita ligar sem querer)
+LIVE_CONFIRMED: bool = os.getenv("LIVE_CONFIRMED", "false").lower() == "true"
+
 # ── Toggles de estratégia ─────────────────────────────────────────────────────
 STRATEGY_A_ENABLED:  bool = os.getenv("STRATEGY_A_ENABLED",  "true").lower() == "true"
 STRATEGY_B1_ENABLED: bool = os.getenv("STRATEGY_B1_ENABLED", "true").lower() == "true"
@@ -42,6 +52,39 @@ CAPITAL_RSRV = TOTAL_CAPITAL * ALLOC_RSRV # $50
 MAX_TRADE_B     = float(os.getenv("MAX_TRADE_B", "0.05"))  # cap por operação B (% do capital total)
 MAX_TRADE_B_USD = TOTAL_CAPITAL * MAX_TRADE_B               # $25
 
+# ── Fees ──────────────────────────────────────────────────────────────────────
+# "min"     — rate × min(p, 1−p), fórmula publicada pela Polymarket (padrão)
+# "product" — rate × p × (1−p), modelo legado que subestimava o custo em 2x
+#             na região p≈0.50; mantido apenas para comparação histórica
+# "auto"    — usa o mais caro dos dois (máxima conservadorismo)
+FEE_MODEL: str = os.getenv("FEE_MODEL", "min")
+
+# Fração mínima do tamanho alvo que o livro precisa comportar para a ordem
+# ser considerada executável. 0.95 = aceita preencher 95% do alvo.
+MIN_FILL_RATIO = float(os.getenv("MIN_FILL_RATIO", "0.95"))
+
+# ── Execução ──────────────────────────────────────────────────────────────────
+# Edge mínimo NA HORA DE ENVIAR. O livro se move entre detectar e executar; se
+# a revalidação mostrar menos que isto, nenhuma ordem sai.
+EXEC_MIN_EDGE      = float(os.getenv("EXEC_MIN_EDGE", "0.01"))
+# Folga no preço limite para a ordem cruzar o book (0.3% acima do ask).
+EXEC_PRICE_BUFFER  = float(os.getenv("EXEC_PRICE_BUFFER", "0.003"))
+# Slippage máximo tolerado em ordem direcional antes de desistir.
+EXEC_MAX_SLIPPAGE  = float(os.getenv("EXEC_MAX_SLIPPAGE", "0.02"))
+
+# ── Risco (aplicado a TODOS os módulos, sem exceção) ──────────────────────────
+MAX_TRADE_PCT            = float(os.getenv("MAX_TRADE_PCT", "0.05"))   # 5% do equity por operação
+MAX_MODULE_EXPOSURE_PCT  = float(os.getenv("MAX_MODULE_EXPOSURE_PCT", "0.25"))
+MAX_OPEN_EXPOSURE_PCT    = float(os.getenv("MAX_OPEN_EXPOSURE_PCT", "0.50"))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "8"))
+DAILY_LOSS_LIMIT_PCT     = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.03"))    # −3% do equity no dia
+MONTHLY_LOSS_LIMIT_PCT   = float(os.getenv("MONTHLY_LOSS_LIMIT_PCT", "0.08"))  # −8% no mês
+MAX_DRAWDOWN_PCT         = float(os.getenv("MAX_DRAWDOWN_PCT", "0.15"))        # −15% arma kill switch
+
+# Intervalo do tracker. Com mercados de 5 minutos, 6 horas deixava o capital
+# marcado como exposto muito depois da resolucao, travando novas entradas.
+TRACKER_INTERVAL_S       = int(os.getenv("TRACKER_INTERVAL_S", "300"))
+
 # ── Fase 2: banca B (lucros de A) ────────────────────────────────────────────
 PHASE2_TRIGGER_USD     = float(os.getenv("PHASE2_TRIGGER_USD", "45"))  # A acumula $45 → ativa B
 BANCA_B_ALLOC_B1       = 0.60   # 60% da banca B para B1
@@ -50,13 +93,32 @@ B_STOP_LOSS_BANCA      = 0.30   # -30% da banca B em qualquer mês → pausar B
 B1_MIN_RESOLVED_FOR_B2 = int(os.getenv("B1_MIN_RESOLVED_FOR_B2", "5"))  # resoluções de B1 para ativar B2
 
 # ── Módulo A — Arbitragem Combinatória ───────────────────────────────────────
-A_MIN_SPREAD          = 0.02   # retorno mínimo base (2%) para trades de 2 mercados
-A_SPREAD_PER_MARKET   = 0.005  # 0.5% adicional por mercado (bid-ask + slippage sequencial)
-A_MAX_FEE             = 0.025  # fee máxima aceita por mercado (2.5%) — padrão Polymarket é 2%
-A_MIN_LIQUIDITY       = 100.0  # $100 mínimo no order book de cada lado
-A_MAX_RESOLUTION_DAYS = 90     # mercados que resolvem em ≤ 90 dias
-A_TRADE_SIZE_USD      = 50.0   # 10% do capital total ($50 com $500)
+# Thresholds revertidos aos valores originais. Foram afrouxados duas vezes
+# (94cd668, 7058ef9) com a justificativa de "destravar detecções" — calibrados
+# pela contagem de sinais, não por P&L. Só voltam a ser afrouxados contra
+# resultado resolvido de verdade.
+A_MIN_SPREAD          = 0.02   # retorno líquido mínimo (2%) para trades de 2 mercados
+A_SPREAD_PER_MARKET   = 0.005  # 0.5% adicional por perna (risco de execução sequencial)
+A_MAX_FEE             = 0.01   # fee máxima aceita por mercado (1%)
+A_MIN_LIQUIDITY       = 100.0  # $100 mínimo nos 5 melhores níveis de cada lado
+A_MAX_RESOLUTION_DAYS = 30     # mercados que resolvem em ≤ 30 dias
+A_TRADE_SIZE_USD      = 50.0   # teto nominal; risk.py corta pelo caixa disponível
 A_SCAN_INTERVAL       = 600    # segundos (10 min)
+
+# Preço usado no cálculo de arbitragem: "ask" varre o livro e usa o preço médio
+# real para o tamanho da ordem; "mid" usa o preço de referência da API (rápido,
+# porém não executável — só para diagnóstico).
+A_PRICING_MODE        = os.getenv("A_PRICING_MODE", "ask")
+
+# Tipo 1 UNDERSUM (comprar YES em todos os candidatos) só paga se algum deles
+# necessariamente vencer. O Polymarket não garante que a lista de candidatos de
+# um evento seja exaustiva, e faixas numéricas descobertas já produziram o pior
+# falso positivo do histórico: "soma YES=82.7%, spread 17.2%" era o preço da
+# cauda ">60" que ninguém estava comprando. Para faixas, a exaustividade é
+# verificada numericamente e o trade é liberado; para candidatos nomeados, não
+# há como verificar — fica desligado.
+A_ALLOW_UNDERSUM_WITHOUT_COVERAGE = os.getenv(
+    "A_ALLOW_UNDERSUM_WITHOUT_COVERAGE", "false").lower() == "true"
 
 # ── Módulo CORR — Scanner de correlações ─────────────────────────────────────
 CORR_SCAN_INTERVAL   = 600    # segundos (10 min)
@@ -67,7 +129,7 @@ CORR_MIN_LIQUIDITY   = 100.0
 A_TARGET_TAGS        = {"Geopolitics", "World"}
 
 # ── Módulo B1 — Weather Oracle ───────────────────────────────────────────────
-B1_MIN_DIVERGENCE    = 0.08   # 8% divergência modelo vs. mercado
+B1_MIN_DIVERGENCE    = 0.20   # 20% divergência modelo vs. mercado (valor original)
 B1_MAX_SHARE_PRICE   = 0.40   # ≤ 40¢ para reduzir fee efetiva
 B1_MIN_LIQUIDITY     = 100.0
 B1_MAX_RESOLUTION_H  = 24     # apenas mercados que resolvem em ≤ 24h
@@ -94,8 +156,33 @@ B1_CITIES = {
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
+# Unidade de temperatura por cidade. O Open-Meteo devolve Celsius por padrão,
+# mas os mercados de cidades dos EUA são cotados em Fahrenheit — comparar 22
+# com um threshold de 75 gerava divergência máxima e sinal confiantemente
+# errado em todo mercado de Nova York.
+# O módulo tenta primeiro ler a unidade do próprio enunciado (°F/°C); esta lista
+# é só o fallback quando a pergunta não diz. Toronto não entra: o Canadá usa °C.
+B1_FAHRENHEIT_CITIES = {
+    c.strip() for c in os.getenv("B1_FAHRENHEIT_CITIES", "New York").split(",") if c.strip()
+}
+
+# Sem unidade explícita na pergunta e cidade fora da lista → descarta o mercado
+# em vez de chutar. Um chute errado aqui vira sinal de 40% de "divergência".
+B1_REQUIRE_KNOWN_UNIT = os.getenv("B1_REQUIRE_KNOWN_UNIT", "true").lower() == "true"
+
+# Desvio-padrao do erro da previsao de maxima em 24h, em graus Celsius.
+# Entra como sigma na normal que converte "previsao vs limiar" em probabilidade.
+# Calibrar contra o historico resolvido: se B1 erra mais do que o modelo diz,
+# este numero esta baixo demais.
+B1_FORECAST_SIGMA_C = float(os.getenv("B1_FORECAST_SIGMA_C", "2.0"))
+
+# Piso/teto de probabilidade do modelo. Previsao de tempo nao da certeza
+# absoluta; sem essa trava o modelo declarava 100% a 3 desvios e gerava
+# "divergencia" de 99% contra qualquer preco.
+B1_PROB_FLOOR = float(os.getenv("B1_PROB_FLOOR", "0.005"))
+
 # ── Módulo B2 — Esports Oracle ───────────────────────────────────────────────
-B2_MIN_DIVERGENCE    = 0.09   # 9% divergência win-rate vs. mercado
+B2_MIN_DIVERGENCE    = 0.15   # 15% divergência win-rate vs. mercado (valor original)
 B2_MAX_SHARE_PRICE   = 0.40
 B2_MIN_LIQUIDITY     = 100.0
 B2_MAX_RESOLUTION_H  = 4      # partidas que resolvem em ≤ 4h
@@ -148,7 +235,7 @@ B4_TARGET_TAGS = {
 }
 B4_MAX_FEE           = 0.0075
 B4_MIN_SPREAD        = 0.020
-B4_MIN_LIQUIDITY     = 150.0
+B4_MIN_LIQUIDITY     = 500.0
 B4_STANDBY_INTERVAL  = 1800  # segundos (30 min)
 B4_ACTIVE_INTERVAL   = 60    # segundos (1 min) quando há jogos ao vivo
 B4_LIVE_WINDOW_H     = 4     # jogo resolve em ≤ 4h
@@ -163,16 +250,45 @@ B2_MIN_MATCHES     = int(os.getenv("B2_MIN_MATCHES", "5"))
 # ── Módulo B5 — Crypto 5-Min Spread Capture ──────────────────────────────────
 STRATEGY_B5_ENABLED: bool = os.getenv("STRATEGY_B5_ENABLED", "true").lower() == "true"
 B5_ASSETS         = ["BTC", "ETH", "SOL"]
-B5_TRADE_SIZE_USD = 25.0      # por lado ($50 total)
-B5_THRESHOLD      = 0.985     # p_up + p_down + fee_total < B5_THRESHOLD
-B5_FEE_RATE       = 0.072     # taker fee crypto Polymarket: fee = rate × p × (1−p)
+B5_TRADE_SIZE_USD = 25.0      # orcamento TOTAL da cesta YES+NO
+                              # (o teto de risco por operacao pode reduzir ainda mais)
+B5_FEE_RATE       = 0.072     # taxa taker crypto Polymarket (aplicada via modules/fees.py)
+
+# Gate único da arbitragem: lucro líquido por par YES+NO, já descontados
+# o fee real (modelo "min") e o slippage real (preço VWAP para o tamanho alvo).
+# Substitui o antigo B5_THRESHOLD, que comparava custo contra 0.985 usando um
+# fee subestimado — um par a 0.46/0.47 aparecia como "edge 3.4%" quando o
+# líquido real era 0.31%.
+B5_MIN_NET_EDGE   = float(os.getenv("B5_MIN_NET_EDGE", "0.015"))   # 1.5% líquido
+B5_THRESHOLD      = 1.0 - B5_MIN_NET_EDGE   # custo all-in máximo por par
+B5_MIN_DEPTH_USD  = float(os.getenv("B5_MIN_DEPTH_USD", "150"))    # profundidade por lado
 B5_T_ENTRY_MIN_S  = 30        # segundos após abertura do candle: início da janela
 B5_T_ENTRY_MAX_S  = 240       # segundos após abertura do candle: fim da janela
 B5_CANDLE_SECS    = 300       # duração do candle (5 minutos)
 B5_SCAN_INTERVAL  = 60        # segundos (1 min)
 
 # ── Módulo B5 Pro — Multi-Strategy ───────────────────────────────────────────
-STRATEGY_B5_PRO_ENABLED: bool = os.getenv("STRATEGY_B5_PRO_ENABLED", "true").lower() == "true"
+# Desligado por padrao: o ARB do B5 Pro e o MESMO trade do modulo B5, nos
+# mesmos mercados. Rodando os dois em paralelo a exposicao dobrava na mesma
+# oportunidade, e o dedup do tracker fazia um sinal engolir o outro no CSV.
+# Escolha um dos dois. B5 e o mais simples; B5 Pro so faz sentido quando
+# NEAR_RES ou REPRICING forem religadas.
+STRATEGY_B5_PRO_ENABLED: bool = os.getenv("STRATEGY_B5_PRO_ENABLED", "false").lower() == "true"
+
+# NEAR_RES e REPRICING desligadas por padrão — ver docs/ESTRATEGIAS.md.
+#
+# NEAR_RES: comprar a 0.96–0.995 por 0.5% de edge é EV≈0 por construção (o preço
+#   É a estimativa de probabilidade), e a distribuição é +2% em 98% dos casos
+#   contra −98% em 2%. Uma perda apaga ~50 ganhos e os eventos são correlacionados
+#   entre BTC/ETH/SOL. Kelly = 0; qualquer tamanho positivo é aposta perdedora.
+#
+# REPRICING: o modelo de fair value foi corrigido (vol escalada pelo tempo
+#   restante), mas continua competindo em latência com HFT e depende de um strike
+#   que o bot infere em vez de ler. Só religar depois de acumular P&L resolvido
+#   positivo em dry-run com o modelo corrigido.
+B5_NEAR_RES_ENABLED:  bool = os.getenv("B5_NEAR_RES_ENABLED",  "false").lower() == "true"
+B5_REPRICING_ENABLED: bool = os.getenv("B5_REPRICING_ENABLED", "false").lower() == "true"
+
 # ARB: mesmos parâmetros do B5 acima
 # NEAR_RES
 B5_NEAR_RES_PRICE_MIN      = 0.96    # preço mínimo do lado vencedor
@@ -181,9 +297,12 @@ B5_NEAR_RES_MIN_EDGE       = 0.005   # edge mínimo após fee (0.5%)
 B5_NEAR_RES_WINDOW_START_S = 60      # T-60s antes do fechamento
 B5_NEAR_RES_WINDOW_END_S   = 10      # T-10s antes do fechamento
 # REPRICING
-B5_REPRICING_MIN_DIVERGENCE = 0.05   # divergência mínima fair vs. poly
+B5_REPRICING_MIN_DIVERGENCE = 0.08   # divergência mínima fair vs. poly
 B5_REPRICING_MIN_LIQUIDITY  = 150.0  # liquidez mínima no lado a comprar
 B5_REPRICING_VOL_CANDLES    = 20     # janela rolante de retornos para vol
+# Nos ultimos segundos do candle a variancia restante tende a zero e o modelo
+# fica numericamente instavel (z explode). Abaixo disso o detector nao opera.
+B5_REPRICING_MIN_SECS_LEFT  = float(os.getenv("B5_REPRICING_MIN_SECS_LEFT", "30"))
 
 # ── Risco ────────────────────────────────────────────────────────────────────
 B_MONTHLY_STOP_LOSS = -0.10   # -10% do capital alocado em B → pausar B
@@ -208,5 +327,47 @@ def validate():
         errors.append(f"Alocações somam {total_alloc:.2%} — deve ser ≤ 100%")
     if not STRATEGY_A_ENABLED:
         errors.append("Estratégia A é obrigatória e não pode ser desativada")
+
+    if FEE_MODEL not in ("min", "product", "auto"):
+        errors.append(f"FEE_MODEL inválido: '{FEE_MODEL}' — use min | product | auto")
+    if not (0.5 <= MIN_FILL_RATIO <= 1.0):
+        errors.append(f"MIN_FILL_RATIO fora de faixa: {MIN_FILL_RATIO} — use 0.5..1.0")
+
+    # Coerência dos limites de risco
+    if MAX_TRADE_PCT > MAX_MODULE_EXPOSURE_PCT:
+        errors.append("MAX_TRADE_PCT > MAX_MODULE_EXPOSURE_PCT — uma única operação estouraria o teto do módulo")
+    if MAX_MODULE_EXPOSURE_PCT > MAX_OPEN_EXPOSURE_PCT:
+        errors.append("MAX_MODULE_EXPOSURE_PCT > MAX_OPEN_EXPOSURE_PCT")
+    if MAX_OPEN_EXPOSURE_PCT > 1.0 - ALLOC_RSRV:
+        errors.append(
+            f"MAX_OPEN_EXPOSURE_PCT ({MAX_OPEN_EXPOSURE_PCT:.0%}) invade a reserva "
+            f"de {ALLOC_RSRV:.0%}"
+        )
+    if DAILY_LOSS_LIMIT_PCT >= MONTHLY_LOSS_LIMIT_PCT:
+        errors.append("DAILY_LOSS_LIMIT_PCT deve ser menor que MONTHLY_LOSS_LIMIT_PCT")
+    if MONTHLY_LOSS_LIMIT_PCT >= MAX_DRAWDOWN_PCT:
+        errors.append("MONTHLY_LOSS_LIMIT_PCT deve ser menor que MAX_DRAWDOWN_PCT")
+
+    # Modo live: exige os dois cadeados e credenciais completas
+    if MODE == "live":
+        if not LIVE_CONFIRMED:
+            errors.append(
+                "MODE=live exige LIVE_CONFIRMED=true no .env — confirmação explícita "
+                "de que a operação com dinheiro real foi autorizada"
+            )
+        if not LIVE_MODULES:
+            errors.append(
+                "MODE=live exige LIVE_MODULES no .env (ex: LIVE_MODULES=A,B4). "
+                "Nenhum módulo executa ordem real sem estar nessa lista"
+            )
+        unknown = LIVE_MODULES - {"A", "B1", "B2", "B3", "B4", "B5", "B5_ARB", "CORR"}
+        if unknown:
+            errors.append(f"LIVE_MODULES contém módulo desconhecido: {sorted(unknown)}")
+        if not (POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE):
+            errors.append(
+                "MODE=live exige POLY_API_KEY/SECRET/PASSPHRASE no .env — rode uma vez "
+                "em dry_run para gerá-las e cole o resultado"
+            )
+
     if errors:
         raise EnvironmentError("Configuração incompleta:\n" + "\n".join(f"  • {e}" for e in errors))

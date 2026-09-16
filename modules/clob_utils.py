@@ -3,6 +3,7 @@
 import logging
 import requests
 from config import config
+from modules import book
 
 logger = logging.getLogger("clob_utils")
 
@@ -34,22 +35,35 @@ def fetch_sampling_markets(max_pages: int = 25) -> list[dict]:
     return markets
 
 
-def get_orderbook_liquidity(token_id: str) -> float:
+def get_orderbook_liquidity(token_id: str, levels: int = 5) -> float:
     """
-    Retorna liquidez disponível nos 5 melhores níveis de ask para um token.
-    Usado para confirmar liquidez mínima antes de entrar.
+    Liquidez em dólares nos `levels` MELHORES níveis de ask.
+
+    A versão anterior fazia `asks[:5]` sobre a resposta crua da API — que
+    devolve os asks do pior para o melhor —, medindo portanto os cinco piores
+    níveis do livro. `modules/book.py` reordena localmente, o que deixa o
+    cálculo correto independentemente da ordem que a API usar.
+
+    Para dimensionar ordem, prefira `book.executable_ask(token_id, usd)`:
+    liquidez agregada não garante preço.
     """
+    return book.depth_usd(token_id, levels)
+
+
+def get_market(condition_id: str) -> dict | None:
+    """Busca um mercado pelo condition_id. None em qualquer falha."""
+    if not condition_id:
+        return None
     try:
         resp = requests.get(
-            f"{config.CLOB_BASE_URL}/book",
-            params={"token_id": token_id},
+            f"{config.CLOB_BASE_URL}/markets/{condition_id}",
             timeout=10,
         )
-        resp.raise_for_status()
-        asks = resp.json().get("asks", [])
-        return sum(float(a["size"]) * float(a["price"]) for a in asks[:5])
-    except (requests.RequestException, KeyError, ValueError):
-        return 0.0
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def token_by_outcome(market: dict, outcome: str) -> dict | None:

@@ -39,7 +39,7 @@ def notify_signal(module: str, question: str, side: str,
     lines = [
         f"<b>[SINAL {module}]{n_str}</b>",
         f"{question[:100]}",
-        f"",
+        "",
         f"Lado: {side} | Entrada: {price_str}",
         f"Spread: {edge_pct} | P&L est: {pnl_est}",
         f"Capital: ${size_usd:.2f} | Fecha: {closes_at}",

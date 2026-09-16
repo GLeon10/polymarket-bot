@@ -2,17 +2,29 @@
 Módulo B5 — Crypto 5-Min Spread Capture (BTC / ETH / SOL)
 
 Arbitragem intra-candle em mercados binários de 5 minutos.
-Compra YES + NO do mesmo mercado quando o custo total (incluindo fee) < threshold:
-    p_up_ask + p_down_ask + fee(p_up) + fee(p_down) < B5_THRESHOLD (0.982)
-    fee(p) = B5_FEE_RATE × p × (1−p)
+Compra YES + NO do mesmo mercado: exatamente uma perna vence, então o par paga
+$1 sempre. Há lucro quando o custo all-in fica abaixo disso com folga:
+
+    edge = (1 − custo) / custo  ≥  B5_MIN_NET_EDGE
+    custo = eff(p_yes) + eff(p_no),  eff(p) = p + rate × min(p, 1−p)
+
+Duas correções importantes em relação à versão anterior:
+
+  Fee. A fórmula era `rate × p × (1−p)`, que cobra metade do fee real em
+  p ≈ 0.50 — justamente onde este módulo opera. Um par a 0.46/0.47 aparecia
+  com "edge 3.4%" quando o líquido verdadeiro era 0.31%.
+
+  Profundidade. O gate usava só o melhor ask, que pode ter 1 share atrás.
+  Agora o preço é o VWAP para o tamanho pretendido e ambos os lados precisam
+  ter B5_MIN_DEPTH_USD de livro.
 
 Mecânica:
   - Busca mercados 5-min BTC/ETH/SOL via Gamma API (REST, a cada B5_SCAN_INTERVAL)
-  - Preços em tempo real via WebSocket CLOB; fallback automático para REST
+  - WebSocket CLOB faz a triagem; o livro REST confirma preço e profundidade
   - Janela de entrada: T+30s a T+240s após abertura do candle
-  - $25 por lado ($50 total); ordens FAK
-  - Dry-run: registra sinal no tracker e notifica Telegram
-  - Live: execução via CLOB client (não implementada nesta versão)
+  - Orcamento total da cesta vem de tracker.trade_budget (teto de risco)
+  - Ordens FOK por perna, com desmonte se a segunda falhar (executor.py)
+  - Dry-run por padrão; live exige MODE=live + LIVE_CONFIRMED + B5 em LIVE_MODULES
 """
 
 import asyncio
@@ -31,7 +43,7 @@ except ImportError:
     _HAS_WS = False
 
 from config import config
-from modules import clob_utils, tracker
+from modules import book, clob_utils, executor, fees, tracker
 
 logger = logging.getLogger("oracle_b5")
 
@@ -74,21 +86,37 @@ class CryptoSpreadSignal:
     p_down_ask: float
     fee_total:  float
     spread:     float       # 1 − (p_up + p_down + fee_total)
-    size_usd:   float       # por lado
+    size_usd:   float       # orcamento total da cesta YES+NO
     end_time:   datetime
     slug:       str = ""
     found_at:   datetime = field(default_factory=datetime.utcnow)
+    yes_token:  str = ""
+    no_token:   str = ""
 
 
 # ── Fórmulas de fee e threshold ───────────────────────────────────────────────
 
 def _fee(p: float) -> float:
-    """Taker fee por unidade para mercados crypto: B5_FEE_RATE × p × (1−p)."""
-    return config.B5_FEE_RATE * p * (1.0 - p)
+    """
+    Taker fee por share. Delega para modules/fees.py.
+
+    A fórmula usada antes aqui era `rate × p × (1−p)`, que em p≈0.50 cobra
+    metade do fee real. Como a arbitragem YES+NO opera exatamente nessa
+    região, o módulo enxergava o dobro do edge que existia: um par a
+    0.46/0.47 aparecia com "3.4% de lucro" quando o líquido real era 0.31%.
+    """
+    return fees.fee_per_share(p, config.B5_FEE_RATE)
 
 
 def _total_cost(p_up: float, p_down: float) -> float:
-    return p_up + p_down + _fee(p_up) + _fee(p_down)
+    """Custo all-in de 1 par YES+NO, que paga exatamente $1 na resolução."""
+    return fees.binary_arb_cost(p_up, p_down, config.B5_FEE_RATE)
+
+
+def _net_edge(p_up: float, p_down: float) -> float:
+    """Retorno líquido sobre o capital do par. Negativo = prejuízo."""
+    cost = _total_cost(p_up, p_down)
+    return (1.0 - cost) / cost if cost > 0 else 0.0
 
 
 def _in_entry_window(end_time: datetime) -> bool:
@@ -178,17 +206,13 @@ def _get_ask(token_id: str) -> float:
 
 
 def _rest_ask(token_id: str) -> float:
-    """Fallback REST: retorna o melhor ask do order book."""
-    try:
-        resp = requests.get(
-            f"{config.CLOB_BASE_URL}/book",
-            params={"token_id": token_id},
-            timeout=5,
-        )
-        asks = resp.json().get("asks", [])
-        return float(asks[0]["price"]) if asks else 0.0
-    except Exception:
-        return 0.0
+    """
+    Fallback REST: melhor ask do livro.
+
+    Antes retornava `asks[0]`, que na resposta da Polymarket é o PIOR ask —
+    a lista vem do pior para o melhor. `book.best_ask` reordena localmente.
+    """
+    return book.best_ask(token_id)
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -332,24 +356,47 @@ def scan() -> list[CryptoSpreadSignal]:
             continue
         in_window += 1
 
-        # Ask via WS (prioritário) ou REST (fallback)
-        p_up   = _get_ask(info["yes_id"])   or _rest_ask(info["yes_id"])
-        p_down = _get_ask(info["no_id"])    or _rest_ask(info["no_id"])
-
-        if p_up <= 0 or p_down <= 0:
+        # Passo 1 — triagem barata pelo WebSocket. Só o melhor ask, sem tamanho.
+        p_up_ws   = _get_ask(info["yes_id"])
+        p_down_ws = _get_ask(info["no_id"])
+        if p_up_ws > 0 and p_down_ws > 0 and _net_edge(p_up_ws, p_down_ws) <= 0:
             continue
 
-        cost = _total_cost(p_up, p_down)
-        if cost >= config.B5_THRESHOLD:
+        # Passo 2 — confirmação no livro, com profundidade para o tamanho real.
+        #
+        # O melhor ask isolado não diz nada sobre quanto dá para comprar por
+        # aquele preço: pode haver 1 share ali. A versão anterior dimensionava
+        # $25 por lado em cima desse preço e chamava de arbitragem. Aqui o preço
+        # usado é o VWAP para o tamanho pretendido, e a cesta é descartada se
+        # qualquer um dos lados não comportar o volume.
+        # Orcamento TOTAL da cesta YES+NO, ja limitado pelo teto de risco.
+        # Cada lado precisa comportar metade dele no livro.
+        size   = tracker.trade_budget("B5")
+        p_up   = book.executable_ask(info["yes_id"], size / 2)
+        p_down = book.executable_ask(info["no_id"],  size / 2)
+        if not (0 < p_up < 1) or not (0 < p_down < 1):
             continue
 
-        fee_t  = _fee(p_up) + _fee(p_down)
-        spread = round(1.0 - cost, 4)
-        asset  = _detect_asset(info["question"])
+        depth_yes = clob_utils.get_orderbook_liquidity(info["yes_id"])
+        depth_no  = clob_utils.get_orderbook_liquidity(info["no_id"])
+        if min(depth_yes, depth_no) < config.B5_MIN_DEPTH_USD:
+            logger.debug(
+                "B5: profundidade insuficiente (yes=$%.0f no=$%.0f, mínimo $%.0f)",
+                depth_yes, depth_no, config.B5_MIN_DEPTH_USD,
+            )
+            continue
+
+        edge = _net_edge(p_up, p_down)
+        if edge < config.B5_MIN_NET_EDGE:
+            continue
+
+        fee_t = _fee(p_up) + _fee(p_down)
+        asset = _detect_asset(info["question"])
 
         logger.info(
-            "SINAL B5 | %s | p_yes=%.3f p_no=%.3f fee=%.4f | lucro=%.2f%%",
-            asset, p_up, p_down, fee_t, spread * 100,
+            "SINAL B5 | %s | p_yes=%.3f p_no=%.3f fee=%.4f | edge_liq=%.2f%% | "
+            "profundidade yes=$%.0f no=$%.0f",
+            asset, p_up, p_down, fee_t, edge * 100, depth_yes, depth_no,
         )
 
         signals.append(CryptoSpreadSignal(
@@ -359,10 +406,12 @@ def scan() -> list[CryptoSpreadSignal]:
             p_up_ask   = round(p_up, 4),
             p_down_ask = round(p_down, 4),
             fee_total  = round(fee_t, 4),
-            spread     = spread,
-            size_usd   = config.B5_TRADE_SIZE_USD,
+            spread     = round(edge, 4),
+            size_usd   = size,
             end_time   = info["end_time"],
             slug       = info["slug"],
+            yes_token  = info["yes_id"],
+            no_token   = info["no_id"],
         ))
 
     if not signals:
@@ -382,24 +431,43 @@ def execute(signal: CryptoSpreadSignal, client) -> bool:
             return False
         _executed.add(signal.market_id)
 
-    if config.MODE == "dry_run":
-        logger.info(
-            "[DRY-RUN] B5 | %s | YES=%.3f NO=%.3f fee=%.4f | spread=%.2f%% | $%.0f/lado",
-            signal.asset, signal.p_up_ask, signal.p_down_ask,
-            signal.fee_total, signal.spread * 100, signal.size_usd,
-        )
-        tracker.record_signal(
-            "B5",
-            signal.market_id,
-            f"[B5] {signal.asset} 5-min: {signal.question}",
-            "Yes+No",
-            round((signal.p_up_ask + signal.p_down_ask) / 2, 4),
-            signal.spread,
-            closes_at_iso=signal.end_time.isoformat(),
-            market_slug=signal.slug,
-            n_markets=2,
-        )
-        return True
+    # Uma cesta YES+NO do MESMO mercado: exatamente uma perna vence, sempre.
+    # Por isso min_payout = 1 share e o par é auto-liquidante na resolução.
+    legs = tracker.build_legs(
+        [
+            (signal.market_id, "Yes", signal.p_up_ask,   signal.yes_token),
+            (signal.market_id, "No",  signal.p_down_ask, signal.no_token),
+        ],
+        tracker.trade_budget("B5"),
+        fee_rate=config.B5_FEE_RATE,
+    )
+    if len(legs) != 2:
+        return False
 
-    logger.warning("B5: execução live não implementada (market_id=%s)", signal.market_id)
-    return False
+    registered = tracker.record_signal(
+        "B5",
+        signal.market_id,
+        f"[B5] {signal.asset} 5-min: {signal.question}",
+        "Yes+No",
+        round((signal.p_up_ask + signal.p_down_ask) / 2, 4),
+        signal.spread,
+        closes_at_iso=signal.end_time.isoformat(),
+        market_slug=signal.slug,
+        n_markets=2,
+        legs=legs,
+        fee_rate=config.B5_FEE_RATE,
+    )
+    if not registered:
+        return False
+
+    if executor.live_enabled("B5"):
+        return executor.execute_basket(
+            client, "B5", signal.market_id, legs, min_payout_per_share=1.0,
+        )
+
+    logger.info(
+        "[DRY-RUN] B5 | %s | YES=%.3f NO=%.3f fee=%.4f | edge_liq=%.2f%% | $%.0f/lado",
+        signal.asset, signal.p_up_ask, signal.p_down_ask,
+        signal.fee_total, signal.spread * 100, signal.size_usd,
+    )
+    return True

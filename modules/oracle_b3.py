@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import requests
 
 from config import config
-from modules import clob_utils, rule_validator, tracker
+from modules import arb, clob_utils, executor, rule_validator, tracker
 
 logger = logging.getLogger("oracle_b3")
 
@@ -83,6 +83,12 @@ class PoliticsSignal:
     market_slugs:      list[str] = field(default_factory=list)
     end_dates:         list[str] = field(default_factory=list)
     rule_quality:      str = "LOW"
+    outcomes:          list[str] = field(default_factory=list)
+    exec_prices:       list[float] = field(default_factory=list)
+    token_ids:         list[str] = field(default_factory=list)
+    fee_rates:         list[float] = field(default_factory=list)
+    min_payout:        float = 1.0
+    budget_usd:        float = 0.0
 
 
 # ── Utilitários de mercado ────────────────────────────────────────────────────
@@ -202,7 +208,31 @@ def _check_resolution_rules(market_ids: list[str]) -> tuple[bool, str]:
 
 def _make_signal(sig_type: int, description: str, markets: list[dict],
                  prices: list[float], spread: float, min_liq: float,
-                 res_ok: bool, res_notes: str) -> PoliticsSignal:
+                 res_ok: bool, res_notes: str,
+                 outcomes: list[str] | None = None,
+                 min_payout: float = 1.0) -> PoliticsSignal | None:
+    """
+    Precifica a cesta no livro e so devolve sinal se o retorno LIQUIDO real
+    passar no minimo. `spread` recebido e a estimativa sobre mids, usada como
+    peneira; o numero que fica gravado e o executavel.
+    """
+    outcomes = outcomes or ["Yes"] * len(markets)
+    budget   = tracker.trade_budget("B3")
+
+    exec_prices, cost = arb.price_basket(markets, outcomes, budget)
+    if not exec_prices or cost <= 0:
+        return None
+
+    fee_rates = [arb.market_fee_rate(m) for m in markets]
+    net_ret   = arb.basket_return(exec_prices, min_payout, fee_rates)
+    if net_ret < arb.min_required_return(len(markets)):
+        logger.debug(
+            "[B3] Descartado — retorno real %.2f%% (mid sugeria %.2f%%): %s",
+            net_ret * 100, spread * 100, description[:60],
+        )
+        return None
+
+    spread = round(net_ret, 4)
     return PoliticsSignal(
         signal_type      = sig_type,
         description      = description,
@@ -213,9 +243,15 @@ def _make_signal(sig_type: int, description: str, markets: list[dict],
         min_liquidity    = min_liq,
         resolution_ok    = res_ok,
         resolution_notes = res_notes,
-        pnl_est          = round(spread * config.B3_TRADE_SIZE_USD, 2),
+        pnl_est          = round(spread * budget, 2),
         market_slugs     = [m.get("market_slug", "") for m in markets],
         end_dates        = [m.get("end_date_iso") or m.get("endDate") or "" for m in markets],
+        outcomes         = outcomes,
+        exec_prices      = [round(p, 4) for p in exec_prices],
+        token_ids        = arb.token_ids(markets, outcomes),
+        fee_rates        = fee_rates,
+        min_payout       = min_payout,
+        budget_usd       = budget,
     )
 
 
@@ -257,15 +293,31 @@ def _detect_sum(candidates: list[dict]) -> list[PoliticsSignal]:
         min_liq = min(_get_min_liquidity(m) for m in group)
         if min_liq < config.B3_MIN_LIQUIDITY:
             continue
-        direction = "OVERSUM" if oversum else "UNDERSUM"
-        action    = "comprar NO em todos" if oversum else "comprar YES em todos"
+        exc, motivo = arb.is_exclusive_event(event)
+        if not exc:
+            logger.info("[B3] 4a descartado — %s: '%s'", motivo, event[:60])
+            continue
+
+        # Mesma razao do modulo A: comprar YES em todos os candidatos so paga
+        # se algum deles necessariamente vencer, e o Polymarket nao garante
+        # que a lista de candidatos de uma eleicao seja exaustiva.
+        if not oversum and not config.A_ALLOW_UNDERSUM_WITHOUT_COVERAGE:
+            logger.debug("[B3] 4a UNDERSUM ignorado — exaustividade nao comprovada: %s", event[:50])
+            continue
+
+        direction  = "OVERSUM" if oversum else "UNDERSUM"
+        action     = "comprar NO em todos" if oversum else "comprar YES em todos"
+        outcomes, min_payout = arb.sum_pattern_legs(n, oversum)
         res_ok, res_notes = _check_resolution_rules([m["condition_id"] for m in group])
-        signals.append(_make_signal(
+        sig = _make_signal(
             4,
             f"Tipo 4a {direction} — '{event[:50]}' ({n} candidatos): "
             f"soma YES={total:.2%} → {action}",
             group, prices, round(ret, 4), min_liq, res_ok, res_notes,
-        ))
+            outcomes=outcomes, min_payout=min_payout,
+        )
+        if sig:
+            signals.append(sig)
     return signals
 
 
@@ -341,12 +393,15 @@ def _detect_dates(candidates: list[dict]) -> list[PoliticsSignal]:
             )
             early_str = dt_early.strftime("%b %d")
             late_str  = dt_late.strftime("%b %d")
-            signals.append(_make_signal(
+            sig = _make_signal(
                 4,
                 f"Tipo 4b DATA — P(by {early_str})={p_early:.2%} > "
-                f"P(by {late_str})={p_late:.2%}",
+                f"P(by {late_str})={p_late:.2%} → comprar NO no prazo curto + YES no longo",
                 [m_early, m_late], [p_early, p_late], spread, min_liq, res_ok, res_notes,
-            ))
+                outcomes=["No", "Yes"], min_payout=1.0,
+            )
+            if sig:
+                signals.append(sig)
     return signals
 
 
@@ -401,11 +456,15 @@ def _detect_candidate_party(candidates: list[dict]) -> list[PoliticsSignal]:
         res_ok, res_notes = _check_resolution_rules(
             [market["condition_id"], m_party["condition_id"]]
         )
-        signals.append(_make_signal(
+        sig = _make_signal(
             4,
-            f"Tipo 4c CAND>PARTIDO — P({cand_name})={p_cand:.2%} > P(partido)={p_party:.2%}",
+            f"Tipo 4c CAND>PARTIDO — P({cand_name})={p_cand:.2%} > P(partido)={p_party:.2%} "
+            f"→ comprar NO no candidato + YES no partido",
             [market, m_party], [p_cand, p_party], spread, min_liq, res_ok, res_notes,
-        ))
+            outcomes=["No", "Yes"], min_payout=1.0,
+        )
+        if sig:
+            signals.append(sig)
     return signals
 
 
@@ -467,21 +526,41 @@ def scan() -> list[PoliticsSignal]:
 # ── Execução (dry-run) ────────────────────────────────────────────────────────
 
 def execute(signal: PoliticsSignal, client) -> bool:
-    if config.MODE == "dry_run":
-        first_slug = signal.market_slugs[0] if signal.market_slugs else ""
-        event_slug = clob_utils.get_event_slug(first_slug) if first_slug else ""
-        tracker.record_signal(
-            "B3",
-            signal.market_ids[0],
-            signal.description[:100],
-            f"arb-t{signal.signal_type}",
-            round(sum(signal.yes_prices) / len(signal.yes_prices), 4),
-            signal.spread,
-            closes_at_iso=signal.end_dates[0] if signal.end_dates else None,
-            market_slug=event_slug or first_slug,
-            n_markets=len(signal.yes_prices),
+    first_slug = signal.market_slugs[0] if signal.market_slugs else ""
+    event_slug = clob_utils.get_event_slug(first_slug) if first_slug else ""
+
+    n         = len(signal.market_ids)
+    token_ids = signal.token_ids or [""] * n
+    fee_rates = signal.fee_rates or [0.0] * n
+    legs = tracker.build_legs(
+        list(zip(signal.market_ids, signal.outcomes, signal.exec_prices,
+                 token_ids, fee_rates)),
+        signal.budget_usd or tracker.trade_budget("B3"),
+    )
+    if not legs:
+        logger.warning("B3: sinal sem pernas executaveis — Tipo %d", signal.signal_type)
+        return False
+
+    registered = tracker.record_signal(
+        "B3",
+        signal.market_ids[0],
+        signal.description[:100],
+        f"arb-t{signal.signal_type}",
+        round(sum(signal.exec_prices) / len(signal.exec_prices), 4),
+        signal.spread,
+        closes_at_iso=signal.end_dates[0] if signal.end_dates else None,
+        market_slug=event_slug or first_slug,
+        n_markets=len(signal.market_ids),
+        legs=legs,
+    )
+    if not registered:
+        return False
+
+    if executor.live_enabled("B3"):
+        return executor.execute_basket(
+            client, "B3", signal.market_ids[0], legs,
+            min_payout_per_share=signal.min_payout,
         )
-        logger.info("   [DRY-RUN] B3 Tipo%d gravado em signals.csv", signal.signal_type)
-        return True
-    logger.warning("Execução live não implementada — B3 Tipo %d", signal.signal_type)
-    return False
+
+    logger.info("   [DRY-RUN] B3 Tipo%d gravado em signals.csv", signal.signal_type)
+    return True

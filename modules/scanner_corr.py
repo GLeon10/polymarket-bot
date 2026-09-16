@@ -27,7 +27,7 @@ from datetime import datetime
 import requests
 
 from config import config
-from modules import clob_utils, tracker
+from modules import arb, clob_utils, executor, tracker
 
 logger = logging.getLogger("scanner_corr")
 
@@ -378,43 +378,129 @@ def scan() -> list[CorrSignal]:
     return _validate(signals, market_by_id)
 
 
+# Extrai o evento da descricao: "Soma YES = 138.00% para 'STEM' (3 candidatos)"
+_STEM_RE = re.compile(r"para '([^']*)'", re.IGNORECASE)
+
+
+def _fetch_markets_by_id(market_ids: list[str]) -> list[dict]:
+    """
+    Relê os mercados no CLOB na hora de montar a cesta. O sinal guarda apenas
+    os IDs, e os preços do momento da detecção já envelheceram — quem decide
+    é o livro atual.
+    """
+    markets = []
+    for mid in market_ids:
+        m = clob_utils.get_market(mid)
+        if m:
+            markets.append(m)
+    return markets
+
+
+def _legs_for_pattern(signal: CorrSignal) -> tuple[list, float] | None:
+    """
+    Lados de cada perna e payout minimo da cesta, derivados do padrao.
+
+    OVERSUM  — compra NO em todas: no maximo uma vence, logo pelo menos n-1
+               NOs pagam. Exige apenas exclusividade mutua.
+    UNDERSUM — compra YES em todas: so paga se alguma vencer, o que exige
+               cobertura total do espaco de resultados. O CORR nao verifica
+               isso, entao o padrao fica bloqueado (ver A_ALLOW_UNDERSUM...).
+    SUBSET   — o detector nao registra qual mercado e o subconjunto e qual e o
+               superconjunto, entao nao da para montar a cesta sem chutar o
+               lado de cada perna. Chutar aqui produz posicao direcional
+               disfarcada de arbitragem: fica so como alerta.
+    """
+    n = len(signal.market_ids)
+    if n < 2:
+        return None
+
+    # O evento que deu nome ao grupo precisa admitir um único vencedor. Foi
+    # aqui que passaram as maiores "arbitragens" do histórico: três partidos
+    # na mesma faixa de votos de Sachsen-Anhalt, somando 138%, lidos como
+    # spread de 38%. Os três podem ficar na faixa ao mesmo tempo.
+    m = _STEM_RE.search(signal.description)
+    if m:
+        exc, motivo = arb.is_exclusive_event(m.group(1))
+        if not exc:
+            logger.info("   CORR descartado — %s: '%s'", motivo, m.group(1)[:60])
+            return None
+
+    if signal.pattern == "oversum":
+        return ["No"] * n, float(n - 1)
+    if signal.pattern == "undersum":
+        if not config.A_ALLOW_UNDERSUM_WITHOUT_COVERAGE:
+            return None
+        return ["Yes"] * n, 1.0
+    return None
+
+
 def execute(signal: CorrSignal, client) -> bool:
-    if config.MODE == "dry_run":
+    logger.info(
+        ">> SINAL CORR | %s | spread_liq=%.2f%% | P&L=$%.2f",
+        signal.pattern.upper(), signal.spread * 100, signal.pnl_est,
+    )
+    for q, p in zip(signal.questions, signal.prices):
+        logger.info("   YES=%.3f | %s", p, q[:70])
+    logger.info("   %s", signal.description)
+
+    plan = _legs_for_pattern(signal)
+    if plan is None:
         logger.info(
-            ">> SINAL CORR | %s | spread_líq=%.2f%% | P&L=$%.2f",
-            signal.pattern.upper(), signal.spread * 100, signal.pnl_est,
+            "   CORR %s: apenas alerta — cesta nao construivel com garantia "
+            "(sem lado por perna ou sem cobertura comprovada)",
+            signal.pattern.upper(),
         )
-        for q, p in zip(signal.questions, signal.prices):
-            logger.info("   YES=%.3f | %s", p, q[:70])
-        logger.info("   %s", signal.description)
+        return False
 
-        # Lado e preço médio de entrada dependem do padrão
-        if signal.pattern == "oversum":
-            side        = "No"
-            entry_price = sum(1.0 - p for p in signal.prices) / len(signal.prices)
-        elif signal.pattern == "undersum":
-            side        = "Yes"
-            entry_price = sum(signal.prices) / len(signal.prices)
-        else:  # subset
-            side        = "Yes/No"
-            entry_price = signal.prices[0]
+    outcomes, min_payout = plan
+    markets = _fetch_markets_by_id(signal.market_ids)
+    if len(markets) != len(signal.market_ids):
+        logger.info("   CORR: nao foi possivel reler todos os mercados — sem acao")
+        return False
 
-        first_slug = signal.market_slugs[0] if signal.market_slugs else ""
-        event_slug = clob_utils.get_event_slug(first_slug) if first_slug else ""
+    budget = tracker.trade_budget("CORR")
+    exec_prices, cost = arb.price_basket(markets, outcomes, budget)
+    if not exec_prices or cost <= 0:
+        logger.info("   CORR: sem profundidade para $%.0f — sem acao", budget)
+        return False
 
-        first_end = signal.end_dates[0] if signal.end_dates else None
-
-        tracker.record_signal(
-            "CORR",
-            signal.market_ids[0] if signal.market_ids else "unknown",
-            signal.description[:100],
-            side,
-            round(entry_price, 4),
-            signal.spread,
-            closes_at_iso=first_end,
-            market_slug=event_slug or first_slug,
-            n_markets=len(signal.market_ids),
+    fee_rates = [arb.market_fee_rate(m) for m in markets]
+    net_ret   = arb.basket_return(exec_prices, min_payout, fee_rates)
+    if net_ret < arb.min_required_return(len(markets)):
+        logger.info(
+            "   CORR: retorno real %.2f%% abaixo do minimo — sem acao", net_ret * 100
         )
-        return True
-    logger.warning("Execução live CORR não implementada")
-    return False
+        return False
+
+    legs = tracker.build_legs(
+        list(zip(signal.market_ids, outcomes, exec_prices,
+                 arb.token_ids(markets, outcomes), fee_rates)),
+        budget,
+    )
+    if not legs:
+        return False
+
+    first_slug = signal.market_slugs[0] if signal.market_slugs else ""
+    event_slug = clob_utils.get_event_slug(first_slug) if first_slug else ""
+
+    registered = tracker.record_signal(
+        "CORR",
+        signal.market_ids[0],
+        signal.description[:100],
+        "No" if signal.pattern == "oversum" else "Yes",
+        round(sum(exec_prices) / len(exec_prices), 4),
+        round(net_ret, 4),
+        closes_at_iso=signal.end_dates[0] if signal.end_dates else None,
+        market_slug=event_slug or first_slug,
+        n_markets=len(signal.market_ids),
+        legs=legs,
+    )
+    if not registered:
+        return False
+
+    if executor.live_enabled("CORR"):
+        return executor.execute_basket(
+            client, "CORR", signal.market_ids[0], legs,
+            min_payout_per_share=min_payout,
+        )
+    return True

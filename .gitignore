@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 *.pyo
 data/logs/
+# Dados de execucao: nunca versionados. Evita que um git pull
+# sobrescreva ou apague o historico de operacoes de uma maquina.
+data/trades/
 .vscode/
 .idea/
 credentials.json

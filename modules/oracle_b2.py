@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import requests
 
 from config import config
-from modules import clob_utils, tracker
+from modules import book, clob_utils, executor, fees, tracker
 
 logger = logging.getLogger("oracle_b2")
 
@@ -262,6 +262,8 @@ class EsportsSignal:
     found_at: datetime
     end_date: str | None = None
     market_slug: str | None = None
+    entry_price: float = 0.0   # preco do LADO COMPRADO (nao mais sempre o YES)
+    token_id: str = ""
 
 
 def scan() -> list[EsportsSignal]:
@@ -316,37 +318,53 @@ def scan() -> list[EsportsSignal]:
             continue
 
         divergence = abs(model_prob - market_price)
+        if divergence < config.B2_MIN_DIVERGENCE:
+            continue
 
-        if (
-            divergence   >= config.B2_MIN_DIVERGENCE
-            and market_price <= config.B2_MAX_SHARE_PRICE
-        ):
-            liquidity = clob_utils.get_orderbook_liquidity(yes_token["token_id"])
-            if liquidity < config.B2_MIN_LIQUIDITY:
-                continue
+        # Mesmo conserto do B1: o preço registrado tem de ser o do lado
+        # comprado. Registrar uma compra de NO a 0.75 como se fosse 0.25
+        # triplicava shares e P&L estimado.
+        side  = "Yes" if model_prob > market_price else "No"
+        token = yes_token if side == "Yes" else clob_utils.token_by_outcome(market, "No")
+        if not token:
+            continue
 
-            side   = "Yes" if model_prob > market_price else "No"
-            signal = EsportsSignal(
-                market_id    = market.get("condition_id", ""),
-                question     = question,
-                game         = game,
-                team_a       = team_a,
-                team_b       = team_b,
-                model_prob   = model_prob,
-                market_price = market_price,
-                divergence   = divergence,
-                side         = side,
-                liquidity    = liquidity,
-                found_at     = datetime.utcnow(),
-                end_date     = market.get("end_date_iso") or market.get("endDate"),
-                market_slug  = market.get("market_slug"),
-            )
-            signals.append(signal)
-            logger.info(
-                "SINAL B2 | %s | %s vs %s | model=%.2f market=%.2f div=%.1f%%",
-                game.upper(), team_a, team_b,
-                model_prob, market_price, divergence * 100,
-            )
+        budget      = tracker.trade_budget("B2")
+        entry_price = book.executable_ask(token["token_id"], budget)
+        if not (0 < entry_price < 1) or entry_price > config.B2_MAX_SHARE_PRICE:
+            continue
+
+        model_side = model_prob if side == "Yes" else 1.0 - model_prob
+        net_edge   = fees.net_edge_directional(entry_price, model_side - entry_price)
+        if net_edge < config.B2_MIN_DIVERGENCE:
+            continue
+
+        liquidity = clob_utils.get_orderbook_liquidity(token["token_id"])
+        if liquidity < config.B2_MIN_LIQUIDITY:
+            continue
+
+        signals.append(EsportsSignal(
+            market_id    = market.get("condition_id", ""),
+            question     = question,
+            game         = game,
+            team_a       = team_a,
+            team_b       = team_b,
+            model_prob   = model_prob,
+            market_price = market_price,
+            divergence   = round(net_edge, 4),
+            side         = side,
+            liquidity    = liquidity,
+            found_at     = datetime.utcnow(),
+            end_date     = market.get("end_date_iso") or market.get("endDate"),
+            market_slug  = market.get("market_slug"),
+            entry_price  = round(entry_price, 4),
+            token_id     = token["token_id"],
+        ))
+        logger.info(
+            "SINAL B2 | %s | %s vs %s | model=%.2f p_%s=%.3f edge_liq=%.1f%%",
+            game.upper(), team_a, team_b,
+            model_prob, side.lower(), entry_price, net_edge * 100,
+        )
 
     logger.info(
         "Varredura B2: %d mercados esports, %d sinais",
@@ -356,18 +374,30 @@ def scan() -> list[EsportsSignal]:
 
 
 def execute(signal: EsportsSignal, client) -> bool:
-    if config.MODE == "dry_run":
-        logger.info(
-            "[DRY-RUN] B2: %s vs %s | %s | side=%s price=%.3f div=%.1f%%",
-            signal.team_a, signal.team_b, signal.game.upper(),
-            signal.side, signal.market_price, signal.divergence * 100,
-        )
-        tracker.record_signal(
-            "B2", signal.market_id, signal.question,
-            signal.side, signal.market_price, signal.divergence,
-            closes_at_iso=signal.end_date,
-            market_slug=signal.market_slug,
-        )
-        return True
-    logger.warning("Execução live não implementada: %s", signal.market_id)
+    budget = tracker.trade_budget("B2")
+    legs   = tracker.build_legs(
+        [(signal.market_id, signal.side, signal.entry_price, signal.token_id)], budget
+    )
+    if not legs:
+        return False
+
+    registered = tracker.record_signal(
+        "B2", signal.market_id, signal.question,
+        signal.side, signal.entry_price, signal.divergence,
+        closes_at_iso=signal.end_date,
+        market_slug=signal.market_slug,
+        legs=legs,
+    )
+    if not registered:
+        return False
+
+    if executor.live_enabled("B2"):
+        return executor.execute_single(client, "B2", signal.market_id, legs[0])
+
+    logger.info(
+        "[DRY-RUN] B2: %s vs %s | %s | side=%s price=%.3f edge_liq=%.1f%%",
+        signal.team_a, signal.team_b, signal.game.upper(),
+        signal.side, signal.entry_price, signal.divergence * 100,
+    )
+    return True
     return False

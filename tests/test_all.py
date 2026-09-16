@@ -3,6 +3,7 @@ Suite de testes consolidada — todos os módulos em um único arquivo.
 Execute com:  pytest tests/test_all.py -q
 """
 
+import contextlib
 import re
 import time
 from datetime import datetime, timezone, timedelta
@@ -32,6 +33,91 @@ from modules.oracle_b4 import (
     _detect_ml_spread, _filter_sports, _is_live_window,
     _is_blocked_final, _normalize_team, scan as _b4_scan,
 )
+from modules import book as book_mod
+from modules import arb as arb_mod
+from modules import fees as fees_mod
+from modules import risk as risk_mod
+from modules import executor as executor_mod
+from modules import tracker as tracker_mod
+
+# ── Livro sintetico compartilhado ─────────────────────────────────────────────
+#
+# Os detectores agora perguntam ao livro qual o preco medio real para o tamanho
+# que pretendem executar, em vez de usar o mid. Nos testes o livro e sintetico:
+# profundidade sobrando ao preco do token, para que o preco de execucao coincida
+# com o mid e as asserticoes de spread continuem medindo a LOGICA do detector,
+# nao o slippage. Testes de profundidade usam _fake_books(..., size=...) baixo.
+
+_FAKE_PRICES: dict[str, float] = {}
+_FAKE_SIZE: dict[str, float] = {}
+
+
+@contextlib.contextmanager
+def _allow_undersum():
+    """
+    UNDERSUM sem cobertura comprovada e bloqueado por padrao (ver config).
+    Os testes que exercitam a mecanica do detector ligam a flag de proposito;
+    o bloqueio em si tem teste proprio.
+    """
+    old = config.A_ALLOW_UNDERSUM_WITHOUT_COVERAGE
+    config.A_ALLOW_UNDERSUM_WITHOUT_COVERAGE = True
+    try:
+        yield
+    finally:
+        config.A_ALLOW_UNDERSUM_WITHOUT_COVERAGE = old
+
+
+def _regm(market, size=100000.0):
+    """Registra um mercado no livro sintetico e devolve ele mesmo."""
+    _reg([market], size)
+    return market
+
+
+def _reg(markets, size=100000.0):
+    """Registra os tokens dos mercados no livro sintetico."""
+    for m in markets:
+        for t in m.get("tokens", []):
+            tid = t.get("token_id")
+            if tid:
+                _FAKE_PRICES[tid] = float(t.get("price", 0) or 0)
+                _FAKE_SIZE[tid]   = size
+    return markets
+
+
+def _reg_token(token_id, price, size=100000.0):
+    _FAKE_PRICES[token_id] = price
+    _FAKE_SIZE[token_id]   = size
+
+
+def _fake_fetch(token_id, timeout=5.0):
+    price = _FAKE_PRICES.get(token_id)
+    if price is None or not (0 < price < 1):
+        return None
+    size = _FAKE_SIZE.get(token_id, 100000.0)
+    return book_mod.Book(
+        token_id=token_id,
+        asks=[book_mod.Level(price, size)],
+        bids=[book_mod.Level(max(price - 0.01, 0.001), size)],
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_state(tmp_path, monkeypatch):
+    """
+    Cada teste roda com livro sintetico e estado (CSV + ledger) proprio.
+    Sem isso, o portao de risco veria exposicao de testes anteriores e os
+    sinais gravados vazariam entre casos.
+    """
+    _FAKE_PRICES.clear()
+    _FAKE_SIZE.clear()
+    monkeypatch.setattr(book_mod, "fetch", _fake_fetch)
+    monkeypatch.setattr(tracker_mod, "_SIGNALS_PATH",  tmp_path / "signals.csv")
+    monkeypatch.setattr(tracker_mod, "_RESOLVED_PATH", tmp_path / "resolved.csv")
+    monkeypatch.setattr(tracker_mod, "_PHASE_PATH",    tmp_path / "phase.json")
+    monkeypatch.setattr(risk_mod,    "_LEDGER_PATH",   tmp_path / "ledger.json")
+    yield
+
+
 from modules import rule_validator
 from modules.rule_validator import _keyword_quality
 from modules import scanner_corr as _scanner_corr_mod
@@ -317,9 +403,9 @@ class TestScannerA:
     def _market(question, yes_price, condition_id=None, slug=None, end_date=None):
         from datetime import datetime, timedelta, timezone as _tz
         if end_date is None:
-            end_date = (datetime.now(_tz.utc) + timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_date = (datetime.now(_tz.utc) + timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
         cid = condition_id or question[:8].lower().replace(" ", "-")
-        return {
+        return _regm({
             "condition_id": cid, "question": question,
             "market_slug": slug or cid, "taker_base_fee": 0,
             "accepting_orders": True, "tags": ["Sports"],
@@ -328,10 +414,11 @@ class TestScannerA:
                 {"outcome": "Yes", "token_id": f"{cid}-yes", "price": yes_price},
                 {"outcome": "No",  "token_id": f"{cid}-no",  "price": round(1 - yes_price, 4)},
             ],
-        }
+        })
 
     @staticmethod
     def _run(markets, liq=200.0, res_text=_RES_OK):
+        _reg(markets)
         with patch("modules.scanner_a.clob_utils.fetch_sampling_markets", return_value=markets), \
              patch("modules.scanner_a.clob_utils.get_orderbook_liquidity", return_value=liq), \
              patch("modules.scanner_a._fetch_resolution_rules", return_value=res_text), \
@@ -343,13 +430,31 @@ class TestScannerA:
     # Tipo 1 ──────────────────────────────────────────────────────────────────
 
     def test_type1_detects_undersum(self):
-        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br"),
-                          self._m("Will Argentina win the World Cup?", 0.35, "ar"),
-                          self._m("Will Germany win the World Cup?", 0.18, "de")])
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br"),
+                              self._m("Will Argentina win the World Cup?", 0.35, "ar"),
+                              self._m("Will Germany win the World Cup?", 0.18, "de")])
         assert len(sigs) == 1
         assert sigs[0].signal_type == 1
         assert abs(sigs[0].spread - round(0.07 / 0.93, 4)) < 1e-3
         assert "UNDERSUM" in sigs[0].description
+
+    def test_type1_undersum_blocked_without_coverage(self):
+        # Comprar YES em todos os candidatos so paga se algum vencer, e nada
+        # garante que a lista de candidatos seja exaustiva. Bloqueado por padrao.
+        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br"),
+                          self._m("Will Argentina win the World Cup?", 0.35, "ar"),
+                          self._m("Will Germany win the World Cup?", 0.18, "de")])
+        assert sigs == []
+
+    def test_type1_oversum_allowed_without_coverage(self):
+        # OVERSUM compra NO em todos: exige apenas exclusividade mutua, que o
+        # formato "quem vence o evento" ja garante.
+        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.45, "br"),
+                          self._m("Will Argentina win the World Cup?", 0.40, "ar"),
+                          self._m("Will Germany win the World Cup?", 0.25, "de")])
+        assert len(sigs) == 1
+        assert "OVERSUM" in sigs[0].description
 
     def test_type1_detects_oversum(self):
         sigs = self._run([self._m("Will Brazil win the World Cup?", 0.45, "br"),
@@ -365,8 +470,9 @@ class TestScannerA:
         assert len(sigs) == 0
 
     def test_type1_accepts_spread_just_above_minimum(self):
-        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.50, "br"),
-                          self._m("Will Argentina win the World Cup?", 0.47, "ar")])
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.50, "br"),
+                              self._m("Will Argentina win the World Cup?", 0.47, "ar")])
         assert len(sigs) == 1
 
     def test_type1_rejects_single_market_group(self):
@@ -397,21 +503,31 @@ class TestScannerA:
         assert len(sigs) == 0
 
     def test_type1_fields_populated(self):
-        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br", slug="brazil-wc"),
-                          self._m("Will Argentina win the World Cup?", 0.35, "ar", slug="argentina-wc"),
-                          self._m("Will Germany win the World Cup?", 0.18, "de", slug="germany-wc")])
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br", slug="brazil-wc"),
+                              self._m("Will Argentina win the World Cup?", 0.35, "ar", slug="argentina-wc"),
+                              self._m("Will Germany win the World Cup?", 0.18, "de", slug="germany-wc")])
         assert len(sigs) == 1
         s = sigs[0]
         assert s.resolution_ok
         assert len(s.market_ids) == 3
         assert s.min_liquidity == 200.0
         assert s.pnl_est > 0
+        # Pernas explicitas: lado, preco executavel e token por mercado
+        assert s.outcomes == ["Yes", "Yes", "Yes"]
+        assert len(s.exec_prices) == 3
+        assert all(t for t in s.token_ids)
+        assert s.min_payout == 1.0
 
     def test_type1_pnl_estimate(self):
-        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br"),
-                          self._m("Will Argentina win the World Cup?", 0.35, "ar"),
-                          self._m("Will Germany win the World Cup?", 0.18, "de")])
-        assert abs(sigs[0].pnl_est - round(0.07 / 0.93, 4) * 50) < 0.05
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br"),
+                              self._m("Will Argentina win the World Cup?", 0.35, "ar"),
+                              self._m("Will Germany win the World Cup?", 0.18, "de")])
+        # O orcamento vem de tracker.trade_budget("A"), ja limitado pelo teto
+        # por operacao do risco — nao mais A_TRADE_SIZE_USD cru.
+        orcamento = tracker_mod.trade_budget("A")
+        assert abs(sigs[0].pnl_est - round(0.07 / 0.93, 4) * orcamento) < 0.05
 
     def test_type1_rejects_fee_above_max(self):
         m = self._m("Will Brazil win the World Cup?", 0.40, "br")
@@ -425,7 +541,8 @@ class TestScannerA:
                    self._m("Will Germany win the World Cup?", 0.18, "de")]
         for m in markets:
             m["taker_base_fee"] = 0.005
-        sigs = self._run(markets)
+        with _allow_undersum():
+            sigs = self._run(markets)
         assert len(sigs) == 1
         assert sigs[0].spread < round(0.07 / 0.93, 4)
 
@@ -442,10 +559,11 @@ class TestScannerA:
         assert len(sigs) == 0
 
     def test_type1_multiple_events_independent(self):
-        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "bwc"),
-                          self._m("Will Argentina win the World Cup?", 0.35, "awc"),
-                          self._m("Will France win the Euros?", 0.42, "feu"),
-                          self._m("Will Spain win the Euros?", 0.38, "seu")])
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "bwc"),
+                              self._m("Will Argentina win the World Cup?", 0.35, "awc"),
+                              self._m("Will France win the Euros?", 0.42, "feu"),
+                              self._m("Will Spain win the Euros?", 0.38, "seu")])
         assert len(sigs) == 2
 
     # Tipo 2 ──────────────────────────────────────────────────────────────────
@@ -455,7 +573,8 @@ class TestScannerA:
                           self._m("Will Brazil win the World Cup?", 0.45, "br")])
         assert len(sigs) == 1
         assert sigs[0].signal_type == 2
-        assert abs(sigs[0].spread - 0.07) < 1e-4
+        # spread agora e retorno sobre o capital: custo 0.38+0.55=0.93 paga 1
+        assert sigs[0].spread == pytest.approx(0.07 / 0.93, abs=1e-3)
 
     def test_type2_rejects_spread_too_small(self):
         sigs = self._run([self._m("Will Brazil or Argentina win the World Cup?", 0.39, "brar"),
@@ -495,7 +614,8 @@ class TestScannerA:
                           self._m("Will Brazil qualify for the Semifinals?", 0.35, "br-semi")])
         assert len(sigs) == 1
         assert sigs[0].signal_type == 3
-        assert abs(sigs[0].spread - 0.10) < 1e-4
+        # custo 0.55 (NO no titulo) + 0.35 (YES na semi) = 0.90, paga 1
+        assert sigs[0].spread == pytest.approx(0.10 / 0.90, abs=1e-3)
 
     def test_type3_rejects_spread_too_small(self):
         sigs = self._run([self._m("Will Brazil win the Championship?", 0.36, "br-champ"),
@@ -544,20 +664,36 @@ class TestScannerA:
             assert scanner_a.scan() == []
 
     def test_execute_dry_run_returns_true(self):
-        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br", slug="brazil-wc"),
-                          self._m("Will Argentina win the World Cup?", 0.35, "ar", slug="argentina-wc"),
-                          self._m("Will Germany win the World Cup?", 0.18, "de", slug="germany-wc")])
-        with patch("modules.scanner_a.tracker.record_signal"):
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br", slug="brazil-wc"),
+                              self._m("Will Argentina win the World Cup?", 0.35, "ar", slug="argentina-wc"),
+                              self._m("Will Germany win the World Cup?", 0.18, "de", slug="germany-wc")])
+        with patch("modules.scanner_a.tracker.record_signal", return_value=True), \
+             patch("modules.scanner_a.clob_utils.get_event_slug", return_value="evt"):
             assert scanner_a.execute(sigs[0], client=None) is True
 
+    def test_execute_returns_false_when_risk_refuses(self):
+        # O tracker recusa o sinal quando o portao de risco nega capacidade;
+        # execute tem de propagar isso em vez de reportar sucesso.
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br"),
+                              self._m("Will Argentina win the World Cup?", 0.35, "ar"),
+                              self._m("Will Germany win the World Cup?", 0.18, "de")])
+        with patch("modules.scanner_a.tracker.record_signal", return_value=False), \
+             patch("modules.scanner_a.clob_utils.get_event_slug", return_value="evt"):
+            assert scanner_a.execute(sigs[0], client=None) is False
+
     def test_execute_records_signal_with_primary_market(self):
-        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br", slug="brazil-wc"),
-                          self._m("Will Argentina win the World Cup?", 0.35, "ar", slug="argentina-wc"),
-                          self._m("Will Germany win the World Cup?", 0.18, "de", slug="germany-wc")])
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br", slug="brazil-wc"),
+                              self._m("Will Argentina win the World Cup?", 0.35, "ar", slug="argentina-wc"),
+                              self._m("Will Germany win the World Cup?", 0.18, "de", slug="germany-wc")])
         recorded = {}
         with patch("modules.scanner_a.tracker.record_signal",
-                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
+                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})), \
+             patch("modules.scanner_a.clob_utils.get_event_slug", return_value="evt"):
             scanner_a.execute(sigs[0], client=None)
+        assert len(recorded["kwargs"]["legs"]) == 3
         assert recorded["args"][0] == "A"
         assert recorded["args"][1] == sigs[0].market_ids[0]
         assert "arb-t1" in recorded["args"][3]
@@ -651,7 +787,8 @@ class TestScannerA:
         assert len(sigs) == 1
         assert sigs[0].signal_type == 2
         assert "THRESHOLD" in sigs[0].description
-        assert abs(sigs[0].spread - 0.05) < 1e-4
+        # custo 0.60 (YES na barra baixa) + 0.35 (NO na barra alta) = 0.95
+        assert sigs[0].spread == pytest.approx(0.05 / 0.95, abs=1e-3)
 
     def test_thresholds_no_signal_correct_ordering(self):
         sigs = self._run([self._m("Will Nvidia revenue be above 50B in 2026?", 0.70, "th1"),
@@ -687,7 +824,8 @@ class TestScannerA:
         assert len(sigs) == 1
         assert sigs[0].signal_type == 2
         assert "DATA" in sigs[0].description
-        assert abs(sigs[0].spread - 0.25) < 1e-4
+        # custo 0.50 (NO no prazo curto) + 0.25 (YES no longo) = 0.75
+        assert sigs[0].spread == pytest.approx(0.25 / 0.75, abs=1e-3)
 
     def test_dates_no_signal_correct_ordering(self):
         sigs = self._run([self._m("Will Nvidia reach $200 by January 2026?", 0.20, "d1"),
@@ -735,7 +873,8 @@ class TestScannerA:
         markets = [self._m("Will Brazil win the World Cup?", 0.40, "br"),
                    self._m("Will Argentina win the World Cup?", 0.35, "ar"),
                    self._m("Will Germany win the World Cup?", 0.18, "de")]
-        with patch("modules.scanner_a.clob_utils.fetch_sampling_markets", return_value=markets), \
+        with _allow_undersum(), \
+             patch("modules.scanner_a.clob_utils.fetch_sampling_markets", return_value=markets), \
              patch("modules.scanner_a.clob_utils.get_orderbook_liquidity", return_value=200.0), \
              patch("modules.scanner_a._fetch_resolution_rules", return_value=_RES_OK), \
              patch("modules.scanner_a.rule_validator.assess", return_value=("MEDIUM", "fonte confiável")):
@@ -744,9 +883,10 @@ class TestScannerA:
         assert sigs[0].rule_quality == "MEDIUM"
 
     def test_scan_rule_quality_stored_on_signal(self):
-        sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br"),
-                          self._m("Will Argentina win the World Cup?", 0.35, "ar"),
-                          self._m("Will Germany win the World Cup?", 0.18, "de")])
+        with _allow_undersum():
+            sigs = self._run([self._m("Will Brazil win the World Cup?", 0.40, "br"),
+                              self._m("Will Argentina win the World Cup?", 0.35, "ar"),
+                              self._m("Will Germany win the World Cup?", 0.18, "de")])
         assert len(sigs) == 1
         assert sigs[0].rule_quality == "HIGH"
 
@@ -758,14 +898,14 @@ class TestScannerA:
 class TestScannerCorr:
     @staticmethod
     def _market(cid="0xABC", question="Will A win X?", price=0.40, fee=0.0, tags=None):
-        return {
+        return _regm({
             "condition_id": cid, "question": question,
             "taker_base_fee": fee, "tags": tags or [],
             "tokens": [
                 {"outcome": "Yes", "token_id": f"yes-{cid}", "price": str(price)},
                 {"outcome": "No",  "token_id": f"no-{cid}",  "price": str(1 - price)},
             ],
-        }
+        })
 
     @staticmethod
     def _sig(pattern="undersum", prices=None, spread=0.10, market_ids=None, questions=None):
@@ -933,41 +1073,62 @@ class TestScannerCorr:
 
     # execute() ────────────────────────────────────────────────────────────────
 
-    def test_execute_oversum_records_no_side_with_url(self):
+    # execute() deixou de gravar o sinal cru: agora rele os mercados, monta a
+    # cesta com o lado de cada perna e so registra se o retorno real passar.
+
+    def _exec(self, sig, markets):
+        recorded = {}
+        with patch("modules.scanner_corr.clob_utils.get_event_slug", return_value="ev-slug"), \
+             patch("modules.scanner_corr._fetch_markets_by_id", return_value=markets), \
+             patch("modules.scanner_corr.tracker.record_signal",
+                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw}) or True):
+            result = _scanner_corr_mod.execute(sig, client=None)
+        return result, recorded
+
+    def test_execute_oversum_records_no_side(self):
+        # OVERSUM de 2 mercados: compra NO nos dois. Paga n-1 = 1 share.
+        # Custo = 0.40 + 0.45 = 0.85 -> retorno 17.6%.
         sig = self._sg(pattern="oversum", prices=[0.60, 0.55], spread=0.15,
                        market_ids=["0xE1", "0xE2"])
         sig.market_slugs = ["slug-a", "slug-b"]
-        recorded = {}
-        with patch("modules.scanner_corr.clob_utils.get_event_slug", return_value="ev-slug"), \
-             patch("modules.scanner_corr.tracker.record_signal",
-                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
-            result = _scanner_corr_mod.execute(sig, client=None)
+        markets = [self._mk("0xE1", price=0.60), self._mk("0xE2", price=0.55)]
+        result, recorded = self._exec(sig, markets)
         assert result is True
         assert recorded["args"][0] == "CORR"
         assert recorded["args"][3] == "No"
         assert recorded["kwargs"]["n_markets"] == 2
-        assert recorded["kwargs"]["market_slug"] == "ev-slug"
+        assert [l.outcome for l in recorded["kwargs"]["legs"]] == ["No", "No"]
 
-    def test_execute_undersum_records_yes_side(self):
+    def test_execute_undersum_blocked_without_coverage(self):
+        # Comprar YES em todos so paga se algum vencer; o CORR nao verifica
+        # exaustividade, entao o padrao fica bloqueado.
         sig = self._sg(pattern="undersum", prices=[0.30, 0.35], spread=0.35,
                        market_ids=["0xE3", "0xE4"])
         sig.market_slugs = ["slug-c", "slug-d"]
-        recorded = {}
-        with patch("modules.scanner_corr.clob_utils.get_event_slug", return_value="ev-slug2"), \
-             patch("modules.scanner_corr.tracker.record_signal",
-                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
-            _scanner_corr_mod.execute(sig, client=None)
+        markets = [self._mk("0xE3", price=0.30), self._mk("0xE4", price=0.35)]
+        result, recorded = self._exec(sig, markets)
+        assert result is False
+        assert recorded == {}
+
+    def test_execute_undersum_allowed_with_flag(self):
+        sig = self._sg(pattern="undersum", prices=[0.30, 0.35], spread=0.35,
+                       market_ids=["0xE3", "0xE4"])
+        sig.market_slugs = ["slug-c", "slug-d"]
+        markets = [self._mk("0xE3", price=0.30), self._mk("0xE4", price=0.35)]
+        with _allow_undersum():
+            result, recorded = self._exec(sig, markets)
+        assert result is True
         assert recorded["args"][3] == "Yes"
 
-    def test_execute_subset_records_yes_no_side(self):
+    def test_execute_subset_is_alert_only(self):
+        # O detector nao registra qual mercado e subconjunto de qual, entao a
+        # cesta nao pode ser montada sem chutar o lado de cada perna.
         sig = self._sg(pattern="subset", market_ids=["0xE5", "0xE6"])
         sig.market_slugs = ["slug-e", "slug-f"]
-        recorded = {}
-        with patch("modules.scanner_corr.clob_utils.get_event_slug", return_value="ev-slug3"), \
-             patch("modules.scanner_corr.tracker.record_signal",
-                   side_effect=lambda *a, **kw: recorded.update({"args": a, "kwargs": kw})):
-            _scanner_corr_mod.execute(sig, client=None)
-        assert recorded["args"][3] == "Yes/No"
+        markets = [self._mk("0xE5"), self._mk("0xE6")]
+        result, recorded = self._exec(sig, markets)
+        assert result is False
+        assert recorded == {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -979,10 +1140,10 @@ class TestOracleB1:
     def _market(question, hours_to_end, yes_price, tags=None):
         slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")
         end  = (datetime.now(timezone.utc) + timedelta(hours=hours_to_end)).isoformat()
-        return {"condition_id": "cid-b1-test", "question": question, "market_slug": slug,
+        return _regm({"condition_id": "cid-b1-test", "question": question, "market_slug": slug,
                 "end_date_iso": end, "tags": tags or ["Weather", "Daily Temperature"],
                 "tokens": [{"outcome": "Yes", "token_id": "yes_tok", "price": yes_price},
-                            {"outcome": "No",  "token_id": "no_tok",  "price": 1 - yes_price}]}
+                            {"outcome": "No",  "token_id": "no_tok",  "price": 1 - yes_price}]})
 
     @staticmethod
     def _forecast(temp_max):
@@ -1008,35 +1169,68 @@ class TestOracleB1:
     def test_city_detected_hong_kong(self):
         assert _city_from_question("Hong Kong high above 33C on May 8?") == "Hong Kong"
 
+    # O modelo deixou de ser uma funcao degrau de constantes fixas e virou
+    # Phi((previsao - limiar) / sigma). As asserticoes passam a cobrar as
+    # propriedades que importam: monotonicidade, simetria e calibracao em
+    # pontos conhecidos da normal.
+
     def test_exceed_clearly_above(self):
-        assert _model_probability(self._forecast(35), "Will temp exceed 30?") == 0.85
+        p = _model_probability(self._forecast(35), "Will temp exceed 30?")
+        assert 0.98 < p < 1.0
 
-    def test_exceed_slightly_above(self):
-        assert _model_probability(self._forecast(31), "Will temp exceed 30?") == 0.60
+    def test_exceed_at_threshold_is_coin_flip(self):
+        assert _model_probability(self._forecast(30), "Will temp exceed 30?") == pytest.approx(0.5)
 
-    def test_exceed_slightly_below(self):
-        assert _model_probability(self._forecast(29), "Will temp exceed 30?") == 0.40
+    def test_exceed_one_sigma_above(self):
+        p = _model_probability(self._forecast(32), "Will temp exceed 30?")
+        assert p == pytest.approx(0.8413, abs=1e-3)
 
     def test_exceed_clearly_below(self):
-        assert _model_probability(self._forecast(25), "Will temp exceed 30?") == 0.15
+        p = _model_probability(self._forecast(25), "Will temp exceed 30?")
+        assert 0.0 < p < 0.02
+
+    def test_exceed_is_monotonic(self):
+        probs = [_model_probability(self._forecast(t), "Will temp exceed 30?")
+                 for t in (25, 28, 30, 32, 35)]
+        assert probs == sorted(probs)
+
+    def test_below_is_complement_of_exceed(self):
+        above = _model_probability(self._forecast(12), "Will temp exceed 10?")
+        below = _model_probability(self._forecast(12), "Will temp be below 10?")
+        assert above + below == pytest.approx(1.0, abs=1e-3)
 
     def test_below_clearly_below(self):
-        assert _model_probability(self._forecast(5),  "Will temp be below 10?") == 0.85
-
-    def test_below_slightly_below(self):
-        assert _model_probability(self._forecast(9),  "Will temp be below 10?") == 0.60
-
-    def test_below_slightly_above(self):
-        assert _model_probability(self._forecast(11), "Will temp be below 10?") == 0.40
+        p = _model_probability(self._forecast(5), "Will temp be below 10?")
+        assert 0.98 < p < 1.0
 
     def test_below_clearly_above(self):
-        assert _model_probability(self._forecast(20), "Will temp be below 10?") == 0.15
+        p = _model_probability(self._forecast(20), "Will temp be below 10?")
+        assert 0.0 < p < 0.02
 
     def test_higher_than_keyword(self):
-        assert _model_probability(self._forecast(35), "Will temp be higher than 30?") == 0.85
+        assert _model_probability(self._forecast(35), "Will temp be higher than 30?") > 0.98
 
     def test_lower_than_keyword(self):
-        assert _model_probability(self._forecast(5),  "Will temp be lower than 10?") == 0.85
+        assert _model_probability(self._forecast(5),  "Will temp be lower than 10?") > 0.98
+
+    # Unidade — o bug que fazia todo mercado de Nova York gerar sinal errado
+
+    def test_unit_read_from_question_fahrenheit(self):
+        assert oracle_b1._question_unit("Will NYC high exceed 75F?", None) == "fahrenheit"
+
+    def test_unit_read_from_question_celsius(self):
+        assert oracle_b1._question_unit("Will London high exceed 30C?", None) == "celsius"
+
+    def test_unit_falls_back_to_city_map(self):
+        assert oracle_b1._question_unit("Will New York high exceed 75?", "New York") == "fahrenheit"
+
+    def test_unit_unknown_city_returns_none(self):
+        assert oracle_b1._question_unit("Will Seoul high exceed 30?", "Seoul") is None
+
+    def test_sigma_scales_with_fahrenheit(self):
+        p_f = _model_probability(self._forecast(78.6), "Will temp exceed 75F?", "fahrenheit")
+        p_c = _model_probability(self._forecast(32.0), "Will temp exceed 30C?", "celsius")
+        assert p_f == pytest.approx(p_c, abs=1e-3)
 
     def test_no_threshold_in_question(self):
         assert _model_probability(self._forecast(30), "Will it be hot today?") is None
@@ -1065,8 +1259,13 @@ class TestOracleB1:
             sigs = oracle_b1.scan()
         assert len(sigs) == 1
         assert sigs[0].city == "London"
-        assert sigs[0].model_prob == 0.85
-        assert abs(sigs[0].divergence - 0.75) < 1e-9
+        # Phi((25 - 20) / 2) com trava nas pontas
+        assert sigs[0].model_prob > 0.98
+        # divergence passou a ser o edge LIQUIDO do lado comprado (modelo - preco
+        # pago - fee), nao mais |modelo - preco YES|
+        assert sigs[0].side == "Yes"
+        assert sigs[0].entry_price == pytest.approx(0.10, abs=1e-6)
+        assert sigs[0].divergence > 0.75
 
     def test_scan_no_signal_low_divergence(self):
         market   = self._market("Will London temp exceed 20C tomorrow?", 10, 0.55)
@@ -1113,10 +1312,10 @@ class TestOracleB2:
         tags = {"lol": ["league of legends"], "dota2": ["Dota 2"]}[game]
         slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")
         end  = (datetime.now(timezone.utc) + timedelta(hours=hours_to_end)).isoformat()
-        return {"condition_id": "cid-b2-test", "question": question, "market_slug": slug,
+        return _regm({"condition_id": "cid-b2-test", "question": question, "market_slug": slug,
                 "end_date_iso": end, "tags": tags,
                 "tokens": [{"outcome": "Yes", "token_id": "yes_tok", "price": yes_price},
-                            {"outcome": "No",  "token_id": "no_tok",  "price": 1 - yes_price}]}
+                            {"outcome": "No",  "token_id": "no_tok",  "price": 1 - yes_price}]})
 
     @staticmethod
     def _ending_in(hours):
@@ -1236,13 +1435,13 @@ class TestOracleB3:
     def _market(question, price=0.30, condition_id=None, tags=None, fee=0.0, end_days=30):
         end_dt = datetime.now(timezone.utc) + timedelta(days=end_days)
         cid    = condition_id or f"0x{abs(hash(question)):016x}"
-        return {
+        return _regm({
             "condition_id": cid, "question": question, "taker_base_fee": fee,
             "tags": tags or ["Politics", "Elections"], "end_date_iso": end_dt.isoformat(),
             "market_slug": "test-slug",
             "tokens": [{"outcome": "Yes", "token_id": f"yes-{cid}", "price": str(price)},
                        {"outcome": "No",  "token_id": f"no-{cid}",  "price": str(1 - price)}],
-        }
+        })
 
     @staticmethod
     def _run_detect(fn, markets, rules="official results"):
@@ -1290,8 +1489,16 @@ class TestOracleB3:
         markets = [self._m("Will Alice win the 2026 senate race?", 0.30, "0xA1"),
                    self._m("Will Bob win the 2026 senate race?",   0.25, "0xA2"),
                    self._m("Will Carol win the 2026 senate race?", 0.20, "0xA3")]
-        sigs = self._run_detect(_detect_sum, markets)
+        with _allow_undersum():
+            sigs = self._run_detect(_detect_sum, markets)
         assert len(sigs) == 1 and "UNDERSUM" in sigs[0].description and sigs[0].signal_type == 4
+
+    def test_detect_sum_undersum_blocked_without_coverage(self):
+        # Lista de candidatos de eleicao nao e garantidamente exaustiva.
+        markets = [self._m("Will Alice win the 2026 senate race?", 0.30, "0xA1"),
+                   self._m("Will Bob win the 2026 senate race?",   0.25, "0xA2"),
+                   self._m("Will Carol win the 2026 senate race?", 0.20, "0xA3")]
+        assert self._run_detect(_detect_sum, markets) == []
 
     def test_detect_sum_oversum(self):
         markets = [self._m("Will Alice win the 2026 senate race?", 0.55, "0xB1"),
@@ -1349,13 +1556,13 @@ class TestOracleB4:
     def _market(question, price=0.50, condition_id=None, tags=None, fee=0.0, hours_to_end=2.0):
         end_dt = datetime.now(timezone.utc) + timedelta(hours=hours_to_end)
         cid    = condition_id or f"0x{abs(hash(question)):016x}"
-        return {
+        return _regm({
             "condition_id": cid, "question": question, "taker_base_fee": fee,
             "tags": tags or ["NBA", "Basketball"], "end_date_iso": end_dt.isoformat(),
             "market_slug": "test-slug",
             "tokens": [{"outcome": "Yes", "token_id": f"yes-{cid}", "price": str(price)},
                        {"outcome": "No",  "token_id": f"no-{cid}",  "price": str(1 - price)}],
-        }
+        })
 
     @staticmethod
     def _detect(markets, liquidity=600.0):
@@ -1408,7 +1615,8 @@ class TestOracleB4:
         spread = self._m("Will the Lakers beat the Celtics by 5+ points?", 0.65, "0xSP1")
         sigs = self._detect([ml, spread])
         assert len(sigs) == 1
-        assert sigs[0].spread_margin == pytest.approx(0.10, abs=1e-4)
+        # custo 0.55 (YES ML) + 0.35 (NO spread) = 0.90, payout minimo 1
+        assert sigs[0].spread_margin == pytest.approx(0.10 / 0.90, abs=1e-3)
         assert sigs[0].side == "Yes ML + No spread"
 
     def test_no_signal_when_spread_below_ml(self):
@@ -1470,12 +1678,23 @@ class TestOracleB5:
     # ── Fórmulas ──────────────────────────────────────────────────────────────
 
     def test_fee_at_midpoint(self):
-        # fee(0.5) = 0.072 × 0.5 × 0.5 = 0.018
-        assert abs(_fee(0.5) - 0.018) < 1e-9
+        # Modelo publicado: fee(0.5) = 0.072 x min(0.5, 0.5) = 0.036.
+        # O modelo antigo (rate x p x (1-p)) dava 0.018 — metade do custo real
+        # exatamente na faixa onde a arbitragem YES+NO opera.
+        assert _fee(0.5) == pytest.approx(0.036, abs=1e-9)
 
     def test_fee_at_low_price(self):
-        # fee(0.1) = 0.072 × 0.1 × 0.9 = 0.00648
-        assert abs(_fee(0.1) - 0.00648) < 1e-9
+        # fee(0.1) = 0.072 x min(0.1, 0.9) = 0.0072
+        assert _fee(0.1) == pytest.approx(0.0072, abs=1e-9)
+
+    def test_fee_model_min_is_costlier_than_legacy_at_midpoint(self):
+        legacy = config.B5_FEE_RATE * 0.5 * 0.5
+        assert _fee(0.5) > legacy
+
+    def test_arb_edge_collapses_under_real_fee(self):
+        # Par 0.46/0.47: o gate antigo (custo < 0.985 com fee subestimado) via
+        # "edge 3.4%"; com o fee real sobra menos de 0.5%.
+        assert oracle_b5_mod._net_edge(0.46, 0.47) < 0.005
 
     def test_fee_zero_at_extremes(self):
         assert _fee(0.0) == 0.0
@@ -1486,8 +1705,9 @@ class TestOracleB5:
         assert _total_cost(0.50, 0.50) > 0.982
 
     def test_total_cost_below_threshold(self):
-        # p_up=p_down=0.44: cost ≈ 0.88 + 0.034 = 0.914 → below 0.982
-        assert _total_cost(0.44, 0.44) < 0.982
+        # p_up=p_down=0.44: custo = 0.88 + 2 x 0.072 x 0.44 = 0.9434
+        assert _total_cost(0.44, 0.44) == pytest.approx(0.94336, abs=1e-4)
+        assert _total_cost(0.44, 0.44) < 1.0
 
     def test_total_cost_symmetric(self):
         assert abs(_total_cost(0.4, 0.5) - _total_cost(0.5, 0.4)) < 1e-12
@@ -1570,13 +1790,17 @@ class TestOracleB5:
             ],
         }
 
-    def _run_scan(self, markets, yes_ask=0.44, no_ask=0.44):
+    def _run_scan(self, markets, yes_ask=0.44, no_ask=0.44, depth=1000.0):
         oracle_b5_mod._watched.clear()
         for m in markets:
             oracle_b5_mod._executed.discard(m.get("condition_id", ""))
+            for t in m.get("tokens", []):
+                tid = t["token_id"]
+                _reg_token(tid, yes_ask if "yes" in tid else no_ask)
         with patch("modules.oracle_b5._find_markets", return_value=markets), \
              patch("modules.oracle_b5._start_ws"), \
              patch("modules.oracle_b5._get_ask", side_effect=lambda tid: yes_ask if "yes" in tid else no_ask), \
+             patch("modules.oracle_b5.clob_utils.get_orderbook_liquidity", return_value=depth), \
              patch("modules.oracle_b5._rest_ask", return_value=0.0):
             return oracle_b5_mod.scan()
 
@@ -1700,12 +1924,17 @@ class TestOracleB5Pro:
     @staticmethod
     def _sig(strategy="ARB", side="Yes+No", market_id="0xPROEX"):
         end = datetime.now(timezone.utc) + timedelta(seconds=120)
+        _reg_token("yes_tok", 0.44)
+        _reg_token("no_tok", 0.44)
         return B5ProSignal(
             strategy=strategy, market_id=market_id,
             question="Will BTC be above $90k in 5 min?",
             asset="BTC", side=side,
             entry_price=0.44, edge=0.06,
             size_usd=25.0, end_time=end,
+            yes_price=0.44, no_price=0.44,
+            yes_token="yes_tok", no_token="no_tok",
+            token_id="yes_tok",
         )
 
     # ── janelas de tempo ──────────────────────────────────────────────────────
@@ -1743,7 +1972,10 @@ class TestOracleB5Pro:
     def test_arb_detects_when_cost_below_threshold(self):
         # p=0.44 each: cost ≈ 0.914 < 0.982
         info = self._info(secs_to_end=120)
-        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.44):
+        _reg_token("yes_tok", 0.44)
+        _reg_token("no_tok", 0.44)
+        with patch.object(oracle_b5_pro_mod, "_ask", return_value=0.44), \
+             patch("modules.oracle_b5_pro.clob_utils.get_orderbook_liquidity", return_value=1000.0):
             sig = oracle_b5_pro_mod._detect_arb("0xARB1", info)
         assert sig is not None
         assert sig.strategy == "ARB"
@@ -1969,3 +2201,644 @@ class TestOracleB5Pro:
             oracle_b5_pro_mod.execute(self._sig("REPRICING", "Yes", "0xRPQ"), None)
         question = recorded["args"][2]
         assert "REPRICING" in question
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# modules/fees — modelo canonico de taxa
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestFees:
+    def test_min_model_at_midpoint(self):
+        assert fees_mod.fee_per_share(0.5, 0.072) == pytest.approx(0.036)
+
+    def test_min_model_is_symmetric(self):
+        assert fees_mod.fee_per_share(0.3, 0.072) == pytest.approx(
+            fees_mod.fee_per_share(0.7, 0.072))
+
+    def test_min_model_doubles_legacy_at_midpoint(self):
+        legacy = 0.072 * 0.5 * 0.5
+        assert fees_mod.fee_per_share(0.5, 0.072) == pytest.approx(2 * legacy)
+
+    def test_models_converge_at_extremes(self):
+        legacy = 0.072 * 0.98 * 0.02
+        assert fees_mod.fee_per_share(0.98, 0.072) == pytest.approx(legacy, rel=0.05)
+
+    def test_zero_rate_means_zero_fee(self):
+        assert fees_mod.fee_per_share(0.5, 0.0) == 0.0
+
+    def test_fee_zero_outside_valid_range(self):
+        assert fees_mod.fee_per_share(0.0, 0.072) == 0.0
+        assert fees_mod.fee_per_share(1.0, 0.072) == 0.0
+        assert fees_mod.fee_per_share(1.5, 0.072) == 0.0
+
+    def test_effective_price_adds_fee(self):
+        assert fees_mod.effective_price(0.40, 0.072) == pytest.approx(0.40 + 0.072 * 0.40)
+
+    def test_binary_arb_edge_positive_when_cheap(self):
+        assert fees_mod.binary_arb_edge(0.40, 0.45, 0.072) > 0
+
+    def test_binary_arb_edge_negative_at_fair_prices(self):
+        # Dois lados somando 1.0 nunca podem dar lucro depois da taxa
+        assert fees_mod.binary_arb_edge(0.50, 0.50, 0.072) < 0
+
+    def test_product_model_selectable(self, monkeypatch):
+        monkeypatch.setattr(config, "FEE_MODEL", "product")
+        assert fees_mod.fee_per_share(0.5, 0.072) == pytest.approx(0.018)
+
+    def test_auto_model_picks_costlier(self, monkeypatch):
+        monkeypatch.setattr(config, "FEE_MODEL", "auto")
+        assert fees_mod.fee_per_share(0.5, 0.072) == pytest.approx(0.036)
+
+    def test_net_edge_directional_discounts_fee(self):
+        assert fees_mod.net_edge_directional(0.30, 0.10, 0.072) == pytest.approx(
+            0.10 - 0.072 * 0.30)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# modules/book — normalizacao do livro
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBook:
+    @staticmethod
+    def _raw(bids, asks):
+        return {
+            "bids": [{"price": str(p), "size": str(s)} for p, s in bids],
+            "asks": [{"price": str(p), "size": str(s)} for p, s in asks],
+        }
+
+    def _parse(self, raw):
+        return book_mod.Book(
+            token_id="t",
+            bids=book_mod._parse_levels(raw["bids"], reverse=True),
+            asks=book_mod._parse_levels(raw["asks"], reverse=False),
+        )
+
+    def test_best_ask_when_api_returns_worst_first(self):
+        # A Polymarket devolve os asks do pior para o melhor. O codigo antigo
+        # pegava asks[0] e comprava pelo PIOR preco do livro.
+        b = self._parse(self._raw(bids=[(0.40, 100)], asks=[(0.60, 100), (0.55, 100), (0.50, 100)]))
+        assert b.best_ask == 0.50
+
+    def test_best_ask_when_api_returns_best_first(self):
+        b = self._parse(self._raw(bids=[(0.40, 100)], asks=[(0.50, 100), (0.55, 100), (0.60, 100)]))
+        assert b.best_ask == 0.50
+
+    def test_best_bid_is_highest_regardless_of_order(self):
+        b = self._parse(self._raw(bids=[(0.30, 100), (0.45, 100), (0.40, 100)], asks=[(0.50, 100)]))
+        assert b.best_bid == 0.45
+
+    def test_spread_and_mid(self):
+        b = self._parse(self._raw(bids=[(0.40, 100)], asks=[(0.50, 100)]))
+        assert b.spread == pytest.approx(0.10)
+        assert b.mid == pytest.approx(0.45)
+
+    def test_invalid_levels_are_dropped(self):
+        b = self._parse(self._raw(bids=[(0.0, 100)], asks=[(1.0, 100), (0.50, 100)]))
+        assert [l.price for l in b.asks] == [0.50]
+        assert b.bids == []
+
+    def test_vwap_single_level(self):
+        b = self._parse(self._raw(bids=[(0.40, 100)], asks=[(0.50, 1000)]))
+        vwap, shares, filled = book_mod.vwap_buy(b, 50.0)
+        assert vwap == pytest.approx(0.50)
+        assert shares == pytest.approx(100.0)
+        assert filled == pytest.approx(50.0)
+
+    def test_vwap_walks_the_book(self):
+        # $10 no nivel de 0.50 (20 shares) + $10 no de 0.60 -> preco medio pior
+        b = self._parse(self._raw(bids=[(0.40, 100)], asks=[(0.60, 1000), (0.50, 20)]))
+        vwap, shares, filled = book_mod.vwap_buy(b, 20.0)
+        assert filled == pytest.approx(20.0)
+        assert 0.50 < vwap < 0.60
+
+    def test_vwap_reports_partial_fill(self):
+        b = self._parse(self._raw(bids=[(0.40, 100)], asks=[(0.50, 10)]))
+        _, _, filled = book_mod.vwap_buy(b, 50.0)
+        assert filled == pytest.approx(5.0)   # 10 shares x 0.50
+
+    def test_vwap_empty_book(self):
+        b = self._parse(self._raw(bids=[], asks=[]))
+        assert book_mod.vwap_buy(b, 50.0) == (0.0, 0.0, 0.0)
+
+    def test_executable_ask_rejects_thin_book(self, monkeypatch):
+        # Melhor ask bom, mas so 1 share atras dele: nao da para executar $50.
+        monkeypatch.setattr(book_mod, "fetch",
+                            lambda tid, timeout=5.0: self._parse(
+                                self._raw(bids=[(0.40, 100)], asks=[(0.50, 1)])))
+        assert book_mod.executable_ask("t", 50.0) == 0.0
+
+    def test_executable_ask_accepts_deep_book(self, monkeypatch):
+        monkeypatch.setattr(book_mod, "fetch",
+                            lambda tid, timeout=5.0: self._parse(
+                                self._raw(bids=[(0.40, 100)], asks=[(0.50, 1000)])))
+        assert book_mod.executable_ask("t", 50.0) == pytest.approx(0.50)
+
+    def test_depth_usd_counts_best_levels(self, monkeypatch):
+        # asks embaralhados: a profundidade tem de somar os MELHORES niveis
+        monkeypatch.setattr(book_mod, "fetch",
+                            lambda tid, timeout=5.0: self._parse(
+                                self._raw(bids=[(0.40, 10)],
+                                          asks=[(0.90, 1000), (0.50, 100), (0.55, 100)])))
+        assert book_mod.depth_usd("t", levels=2) == pytest.approx(0.50 * 100 + 0.55 * 100)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# modules/risk — caixa, limites e kill switch
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRisk:
+    def test_starts_with_full_cash_minus_reserve(self):
+        esperado = config.TOTAL_CAPITAL * (1 - config.ALLOC_RSRV)
+        assert risk_mod.available_cash() == pytest.approx(esperado)
+
+    def test_equity_starts_at_total_capital(self):
+        assert risk_mod.equity() == pytest.approx(config.TOTAL_CAPITAL)
+
+    def test_open_position_reduces_cash(self):
+        risk_mod.open_position("s1", "A", 50.0)
+        assert risk_mod.open_exposure() == pytest.approx(50.0)
+        assert risk_mod.available_cash() == pytest.approx(
+            config.TOTAL_CAPITAL * (1 - config.ALLOC_RSRV) - 50.0)
+
+    def test_open_position_is_idempotent(self):
+        assert risk_mod.open_position("s1", "A", 50.0) is True
+        assert risk_mod.open_position("s1", "A", 50.0) is False
+        assert risk_mod.open_exposure() == pytest.approx(50.0)
+
+    def test_close_position_releases_capital_and_books_pnl(self):
+        risk_mod.open_position("s1", "A", 50.0)
+        risk_mod.close_position("s1", 5.0, "A")
+        assert risk_mod.open_exposure() == 0.0
+        assert risk_mod.equity() == pytest.approx(config.TOTAL_CAPITAL + 5.0)
+
+    def test_rejects_trade_above_per_trade_cap(self):
+        ok, motivo = risk_mod.check_capacity("A", config.MAX_TRADE_PCT * config.TOTAL_CAPITAL + 1)
+        assert ok is False and "teto por operacao" in motivo
+
+    def test_rejects_when_module_cap_reached(self):
+        cap = config.MAX_MODULE_EXPOSURE_PCT * config.TOTAL_CAPITAL
+        risk_mod.open_position("s1", "A", cap)
+        ok, motivo = risk_mod.check_capacity("A", 10.0)
+        assert ok is False and "modulo A" in motivo
+
+    def test_other_module_still_has_room(self):
+        cap = config.MAX_MODULE_EXPOSURE_PCT * config.TOTAL_CAPITAL
+        risk_mod.open_position("s1", "A", cap)
+        ok, _ = risk_mod.check_capacity("B4", 10.0)
+        assert ok is True
+
+    def test_rejects_when_max_concurrent_reached(self):
+        for i in range(config.MAX_CONCURRENT_POSITIONS):
+            risk_mod.open_position(f"s{i}", f"M{i}", 1.0)
+        ok, motivo = risk_mod.check_capacity("A", 1.0)
+        assert ok is False and "posicoes abertas" in motivo
+
+    def test_rejects_after_daily_loss_limit(self):
+        risk_mod.open_position("s1", "A", 40.0)
+        risk_mod.close_position("s1", -(config.DAILY_LOSS_LIMIT_PCT * config.TOTAL_CAPITAL) - 1, "A")
+        ok, motivo = risk_mod.check_capacity("A", 10.0)
+        assert ok is False and "diaria" in motivo
+
+    def test_drawdown_trips_kill_switch(self):
+        perda = config.MAX_DRAWDOWN_PCT * config.TOTAL_CAPITAL + 1
+        risk_mod.open_position("s1", "A", 100.0)
+        risk_mod.close_position("s1", -perda, "A")
+        assert risk_mod.is_tripped() is True
+
+    def test_kill_switch_blocks_everything(self):
+        risk_mod.trip("teste")
+        ok, motivo = risk_mod.check_capacity("A", 1.0)
+        assert ok is False and "kill switch" in motivo
+
+    def test_kill_switch_reset_is_manual(self):
+        risk_mod.trip("teste")
+        risk_mod.reset_kill_switch()
+        assert risk_mod.is_tripped() is False
+        ok, _ = risk_mod.check_capacity("A", 10.0)
+        assert ok is True
+
+    def test_drawdown_measured_from_peak_not_start(self):
+        risk_mod.open_position("s1", "A", 10.0)
+        risk_mod.close_position("s1", 100.0, "A")     # equity 600, pico 600
+        risk_mod.open_position("s2", "A", 10.0)
+        risk_mod.close_position("s2", -60.0, "A")     # equity 540
+        assert risk_mod.drawdown() == pytest.approx(60.0 / 600.0, abs=1e-3)
+
+    def test_zero_or_negative_cost_rejected(self):
+        ok, _ = risk_mod.check_capacity("A", 0.0)
+        assert ok is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# modules/tracker — contabilidade real por perna
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTrackerLegs:
+    def test_build_legs_gives_equal_shares(self):
+        legs = tracker_mod.build_legs(
+            [("m1", "Yes", 0.40), ("m2", "Yes", 0.35)], 50.0, fee_rate=0.0)
+        assert len(legs) == 2
+        assert legs[0].shares == pytest.approx(legs[1].shares)
+
+    def test_build_legs_respects_budget(self):
+        legs = tracker_mod.build_legs(
+            [("m1", "Yes", 0.40), ("m2", "Yes", 0.35)], 50.0, fee_rate=0.0)
+        assert sum(l.cost_usd for l in legs) == pytest.approx(50.0, abs=1e-6)
+
+    def test_build_legs_includes_fee_in_cost(self):
+        sem = tracker_mod.build_legs([("m1", "Yes", 0.50)], 50.0, fee_rate=0.0)
+        com = tracker_mod.build_legs([("m1", "Yes", 0.50)], 50.0, fee_rate=0.072)
+        assert com[0].shares < sem[0].shares   # a taxa come parte do orcamento
+
+    def test_build_legs_per_leg_fee_rate(self):
+        legs = tracker_mod.build_legs(
+            [("m1", "Yes", 0.50, "t1", 0.0), ("m2", "Yes", 0.50, "t2", 0.072)], 50.0)
+        assert legs[0].fee_usd == 0.0
+        assert legs[1].fee_usd > 0.0
+
+    def test_build_legs_rejects_invalid_price(self):
+        assert tracker_mod.build_legs([("m1", "Yes", 0.0)], 50.0) == []
+        assert tracker_mod.build_legs([("m1", "Yes", 1.0)], 50.0) == []
+
+    def test_build_legs_carries_token_id(self):
+        legs = tracker_mod.build_legs([("m1", "Yes", 0.40, "tok-1")], 50.0, fee_rate=0.0)
+        assert legs[0].token_id == "tok-1"
+
+
+class TestTrackerAccounting:
+    """
+    Regressao do bug central: para arbitragem, o P&L resolvido era
+    `size_usd * edge` — o edge teorico do momento da deteccao, sem olhar a
+    resolucao. Nenhum modulo de arb conseguia registrar prejuizo.
+    """
+
+    @staticmethod
+    def _record(module, legs, edge=0.05, market_id="0xM1"):
+        with patch("modules.tracker.notifier.notify_signal"), \
+             patch("modules.tracker.sheets.append_signal"):
+            return tracker_mod.record_signal(
+                module, market_id, "pergunta de teste", "arb-t1", 0.5, edge, legs=legs)
+
+    @staticmethod
+    def _resolve(outcomes):
+        with patch("modules.tracker._winning_outcome", side_effect=lambda mid: outcomes.get(mid)), \
+             patch("modules.tracker.sheets.append_resolved"):
+            tracker_mod.check_resolutions()
+        return tracker_mod._read_csv(tracker_mod._RESOLVED_PATH)
+
+    def test_records_signal_with_legs(self):
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        assert self._record("A", legs) is True
+        rows = tracker_mod._read_csv(tracker_mod._SIGNALS_PATH)
+        assert len(rows) == 1 and rows[0]["module"] == "A"
+        assert rows[0]["legs_json"]
+
+    def test_winning_directional_pnl_is_real(self):
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        self._record("B1", legs)
+        rows = self._resolve({"0xM1": "yes"})
+        # 50 shares a 0.40 = $20; paga $50 -> lucro $30
+        assert float(rows[0]["payout_usd"]) == pytest.approx(50.0, abs=0.01)
+        assert float(rows[0]["pnl_usd"]) == pytest.approx(30.0, abs=0.01)
+        assert rows[0]["result"] == "WIN"
+
+    def test_losing_directional_loses_the_whole_stake(self):
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        self._record("B1", legs)
+        rows = self._resolve({"0xM1": "no"})
+        assert float(rows[0]["pnl_usd"]) == pytest.approx(-20.0, abs=0.01)
+        assert rows[0]["result"] == "LOSS"
+
+    def test_valid_arb_profits_on_either_outcome(self):
+        # YES a 0.40 + NO a 0.45 = cesta de $1 por 0.85
+        legs = tracker_mod.build_legs(
+            [("0xM1", "Yes", 0.40, "t1"), ("0xM1", "No", 0.45, "t2")], 17.0, fee_rate=0.0)
+        self._record("B5", legs)
+        rows = self._resolve({"0xM1": "yes"})
+        assert float(rows[0]["pnl_usd"]) > 0
+        assert rows[0]["result"] == "WIN"
+
+    def test_broken_arb_is_recorded_as_loss(self):
+        # AQUI esta a regressao: uma cesta mal formada — duas pernas que NAO
+        # sao mutuamente exclusivas, ambas perdendo — tem de aparecer como
+        # prejuizo. Na contabilidade antiga isso era gravado como lucro igual
+        # ao edge teorico, sempre.
+        legs = tracker_mod.build_legs(
+            [("0xM1", "Yes", 0.40, "t1"), ("0xM2", "Yes", 0.45, "t2")], 17.0, fee_rate=0.0)
+        self._record("A", legs, edge=0.10)
+        rows = self._resolve({"0xM1": "no", "0xM2": "no"})
+        assert float(rows[0]["payout_usd"]) == 0.0
+        assert float(rows[0]["pnl_usd"]) == pytest.approx(-17.0, abs=0.01)
+        assert rows[0]["result"] == "LOSS"
+
+    def test_partial_basket_pays_only_winning_legs(self):
+        legs = tracker_mod.build_legs(
+            [("0xM1", "Yes", 0.40, "t1"), ("0xM2", "Yes", 0.40, "t2")], 20.0, fee_rate=0.0)
+        self._record("A", legs)
+        rows = self._resolve({"0xM1": "yes", "0xM2": "no"})
+        # 25 shares por perna; so uma paga
+        assert float(rows[0]["payout_usd"]) == pytest.approx(25.0, abs=0.01)
+
+    def test_unresolved_leg_keeps_signal_open(self):
+        legs = tracker_mod.build_legs(
+            [("0xM1", "Yes", 0.40, "t1"), ("0xM2", "Yes", 0.40, "t2")], 20.0, fee_rate=0.0)
+        self._record("A", legs)
+        rows = self._resolve({"0xM1": "yes"})   # 0xM2 ainda aberto
+        assert rows == []
+
+    def test_resolution_releases_capital_in_ledger(self):
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        self._record("B1", legs)
+        assert risk_mod.open_exposure() == pytest.approx(20.0, abs=0.01)
+        self._resolve({"0xM1": "yes"})
+        assert risk_mod.open_exposure() == pytest.approx(0.0, abs=1e-6)
+        assert risk_mod.equity() > config.TOTAL_CAPITAL
+
+    def test_signal_refused_when_risk_has_no_capacity(self):
+        risk_mod.trip("teste de bloqueio")
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        assert self._record("A", legs) is False
+        assert tracker_mod._read_csv(tracker_mod._SIGNALS_PATH) == []
+
+    def test_duplicate_signal_is_ignored(self):
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        assert self._record("A", legs) is True
+        assert self._record("A", legs) is False
+
+    def test_same_market_different_modules_both_recorded(self):
+        # O dedup era por market_id global, entao um modulo engolia o sinal do
+        # outro no mesmo mercado. Agora a chave inclui o modulo.
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        assert self._record("A", legs) is True
+        assert self._record("B5", legs) is True
+        assert len(tracker_mod._read_csv(tracker_mod._SIGNALS_PATH)) == 2
+
+    def test_module_pnl_sums_resolved_only(self):
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        self._record("B1", legs)
+        assert tracker_mod.get_module_pnl("B1") == 0.0
+        self._resolve({"0xM1": "yes"})
+        assert tracker_mod.get_module_pnl("B1") == pytest.approx(30.0, abs=0.01)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# modules/executor — cadeados do modo live
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExecutorGating:
+    def test_dry_run_blocks_everything(self, monkeypatch):
+        monkeypatch.setattr(config, "MODE", "dry_run")
+        monkeypatch.setattr(config, "LIVE_CONFIRMED", True)
+        monkeypatch.setattr(config, "LIVE_MODULES", {"A"})
+        assert executor_mod.live_enabled("A") is False
+
+    def test_live_without_confirmation_blocks(self, monkeypatch):
+        monkeypatch.setattr(config, "MODE", "live")
+        monkeypatch.setattr(config, "LIVE_CONFIRMED", False)
+        monkeypatch.setattr(config, "LIVE_MODULES", {"A"})
+        assert executor_mod.live_enabled("A") is False
+
+    def test_module_outside_whitelist_blocks(self, monkeypatch):
+        monkeypatch.setattr(config, "MODE", "live")
+        monkeypatch.setattr(config, "LIVE_CONFIRMED", True)
+        monkeypatch.setattr(config, "LIVE_MODULES", {"A"})
+        assert executor_mod.live_enabled("B5") is False
+
+    def test_all_locks_open_allows(self, monkeypatch):
+        monkeypatch.setattr(config, "MODE", "live")
+        monkeypatch.setattr(config, "LIVE_CONFIRMED", True)
+        monkeypatch.setattr(config, "LIVE_MODULES", {"A"})
+        assert executor_mod.live_enabled("A") is True
+
+    def test_kill_switch_overrides_all_locks(self, monkeypatch):
+        monkeypatch.setattr(config, "MODE", "live")
+        monkeypatch.setattr(config, "LIVE_CONFIRMED", True)
+        monkeypatch.setattr(config, "LIVE_MODULES", {"A"})
+        risk_mod.trip("teste")
+        assert executor_mod.live_enabled("A") is False
+
+    def test_defaults_are_off(self):
+        # Sem nenhum monkeypatch: o bot nao executa ordem real
+        assert executor_mod.live_enabled("A") is False
+        assert executor_mod.live_enabled("B4") is False
+
+    def test_buy_price_rounds_up_to_tick(self):
+        assert executor_mod._round_buy_price(0.5123, 0.01) == pytest.approx(0.52)
+
+    def test_sell_price_rounds_down_to_tick(self):
+        assert executor_mod._round_sell_price(0.5178, 0.01) == pytest.approx(0.51)
+
+    def test_order_response_needs_explicit_success(self):
+        assert executor_mod._order_ok({"success": False}) is False
+        assert executor_mod._order_ok({"status": "matched"}) is True
+        assert executor_mod._order_ok(None) is False
+        assert executor_mod._order_ok({}) is False
+
+    def test_execute_basket_without_client_fails(self):
+        legs = tracker_mod.build_legs([("0xM1", "Yes", 0.40, "t1")], 20.0, fee_rate=0.0)
+        assert executor_mod.execute_basket(None, "A", "sig", legs) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# modules/arb — validacao de faixas e payout minimo
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestArbBaskets:
+    def test_oversum_payout_is_n_minus_one(self):
+        outcomes, payout = arb_mod.sum_pattern_legs(4, oversum=True)
+        assert outcomes == ["No"] * 4 and payout == 3.0
+
+    def test_undersum_payout_is_one(self):
+        outcomes, payout = arb_mod.sum_pattern_legs(4, oversum=False)
+        assert outcomes == ["Yes"] * 4 and payout == 1.0
+
+    def test_min_required_return_grows_with_legs(self):
+        assert arb_mod.min_required_return(4) > arb_mod.min_required_return(2)
+
+    def test_basket_return_uses_per_market_rates(self):
+        sem_taxa = arb_mod.basket_return([0.40, 0.45], 1.0, [0.0, 0.0])
+        com_taxa = arb_mod.basket_return([0.40, 0.45], 1.0, [0.072, 0.072])
+        assert com_taxa < sem_taxa
+
+    def test_market_fee_rate_defaults_to_zero(self):
+        assert arb_mod.market_fee_rate({}) == 0.0
+        assert arb_mod.market_fee_rate({"taker_base_fee": "0.01"}) == pytest.approx(0.01)
+
+
+class TestExclusividade:
+    """
+    Regressao dos sinais reais da planilha. A soma dos precos YES so carrega
+    informacao quando os eventos sao mutuamente exclusivos. As maiores
+    "arbitragens" do historico ($82 de $160 declarados) vinham de grupos em que
+    varios eventos podiam ocorrer juntos — tres partidos na mesma faixa de
+    votos de Sachsen-Anhalt, somando 138%, lidos como spread de 38%.
+    """
+
+    # --- casos reais que DEVEM ser rejeitados ---
+
+    def test_faixa_de_votos_sachsen_anhalt(self):
+        ok, motivo = arb_mod.is_exclusive_event("between 5% and 7% of all valid second votes")
+        assert ok is False and "votos" in motivo
+
+    def test_menos_de_3_por_cento(self):
+        assert arb_mod.is_exclusive_event("less than 3% of all valid second votes")[0] is False
+
+    def test_pelo_menos_7_por_cento(self):
+        assert arb_mod.is_exclusive_event("at least 7% of all valid second votes")[0] is False
+
+    def test_faixa_de_cadeiras_knesset(self):
+        assert arb_mod.is_exclusive_event("8-9 seats in the 2026 knesset elections")[0] is False
+
+    def test_dez_ou_mais_cadeiras(self):
+        assert arb_mod.is_exclusive_event("10 or more seats in the 2026 knesset elections")[0] is False
+
+    def test_uma_cadeira(self):
+        # Varios partidos ganham "uma cadeira" ao mesmo tempo
+        assert arb_mod.is_exclusive_event("a seat in the 2026 knesset elections")[0] is False
+
+    def test_menos_de_5_cadeiras_quebec(self):
+        assert arb_mod.is_exclusive_event(
+            "fewer than 5 seats in the national assembly of quebec in this election")[0] is False
+
+    def test_faixa_percentual_knesset(self):
+        assert arb_mod.is_exclusive_event("6-7% of the vote in the 2026 knesset elections")[0] is False
+
+    # --- casos reais que DEVEM passar ---
+
+    def test_posto_unico_mais_cadeiras(self):
+        ok, motivo = arb_mod.is_exclusive_event("the most seats in the 2026 quebec general election")
+        assert ok is True and "posto" in motivo
+
+    def test_posto_unico_terceiro_lugar(self):
+        assert arb_mod.is_exclusive_event(
+            "the third-most seats in the next russian parliamentary election")[0] is True
+
+    def test_posto_unico_maior_numero_de_votos(self):
+        assert arb_mod.is_exclusive_event("greatest number of valid votes in the first round")[0] is True
+
+    def test_eleicao_presidencial(self):
+        ok, motivo = arb_mod.is_exclusive_event("the next bulgarian presidential election")
+        assert ok is True and "vencedor" in motivo
+
+    def test_eleicao_municipal(self):
+        assert arb_mod.is_exclusive_event("the 2026 seoul mayoral election")[0] is True
+
+    def test_premio_com_um_ganhador(self):
+        assert arb_mod.is_exclusive_event("the nobel peace prize in 2026")[0] is True
+
+    # --- a faixa tem de ser sobre o PLACAR do sujeito, nao sobre a margem ---
+
+    def test_margem_do_vencedor_e_exclusiva(self):
+        # So um candidato vence, logo so um vence "por menos de 5%"
+        ok, motivo = arb_mod.is_exclusive_event(
+            "the first round of the 2026 brazilian presidential election by less than 5%")
+        assert ok is True and "margem" in motivo
+
+    def test_margem_em_faixa_e_exclusiva(self):
+        assert arb_mod.is_exclusive_event(
+            "the 2026 berlin state election by a margin of 5-10%")[0] is True
+
+    def test_margem_dez_por_cento_ou_mais_e_exclusiva(self):
+        assert arb_mod.is_exclusive_event(
+            "the 2026 mecklenburg-vorpommern state election by a margin of 10% or more")[0] is True
+
+    def test_evento_vazio_rejeitado(self):
+        assert arb_mod.is_exclusive_event("")[0] is False
+        assert arb_mod.is_exclusive_event("   ")[0] is False
+
+    # --- integracao: o detector precisa descartar o grupo ---
+
+    def test_type1_descarta_grupo_nao_exclusivo(self):
+        # Reproduz o sinal real: tres partidos, mesma faixa, soma 138%
+        sigs = TestScannerA._run([
+            TestScannerA._market("Will SPD win between 5% and 7% of all valid second votes?", 0.50, "spd"),
+            TestScannerA._market("Will Grune win between 5% and 7% of all valid second votes?", 0.45, "gru"),
+            TestScannerA._market("Will BSW win between 5% and 7% of all valid second votes?", 0.43, "bsw"),
+        ])
+        assert sigs == []
+
+    def test_type1_aceita_grupo_exclusivo(self):
+        sigs = TestScannerA._run([
+            TestScannerA._market("Will Alice win the 2026 seoul mayoral election?", 0.45, "al"),
+            TestScannerA._market("Will Bob win the 2026 seoul mayoral election?", 0.40, "bo"),
+            TestScannerA._market("Will Carol win the 2026 seoul mayoral election?", 0.25, "ca"),
+        ])
+        assert len(sigs) == 1 and "OVERSUM" in sigs[0].description
+
+
+class TestRangeValidation:
+    """
+    O pior falso positivo do historico: faixas 0-10/10-20/20-40/40-60 de
+    transitos no Estreito de Ormuz, soma YES = 82.7%, registradas como
+    "spread 17.2%". Os 17% eram o preco da cauda ">60" que a cesta estaria
+    vendendo — nao ineficiencia.
+    """
+
+    @staticmethod
+    def _b(q):
+        return scanner_a._range_bounds(q)
+
+    def test_parses_between(self):
+        assert self._b("Will X be between 10 and 20 widgets?") == (10.0, 20.0)
+
+    def test_parses_currency_between(self):
+        assert self._b("Will X be between $2T and $3T?") == (2e12, 3e12)
+
+    def test_parses_less_than(self):
+        assert self._b("Will X be less than 10 widgets?") == (float("-inf"), 10.0)
+
+    def test_parses_greater_than(self):
+        assert self._b("Will X be greater than 60 widgets?") == (60.0, float("inf"))
+
+    def test_rejects_inverted_between(self):
+        assert self._b("Will X be between 20 and 10 widgets?") is None
+
+    def test_no_range_returns_none(self):
+        assert self._b("Will it rain tomorrow?") is None
+
+    def test_uncovered_tail_rejected_for_undersum(self):
+        bounds = [(0.0, 10.0), (10.0, 20.0), (20.0, 40.0), (40.0, 60.0)]
+        ok, motivo = scanner_a._validate_range_set(bounds, need_coverage=True)
+        assert ok is False and "extremo" in motivo
+
+    def test_uncovered_tail_accepted_for_oversum(self):
+        # Comprar NO em todas so exige que no maximo uma vença.
+        bounds = [(0.0, 10.0), (10.0, 20.0), (20.0, 40.0), (40.0, 60.0)]
+        ok, _ = scanner_a._validate_range_set(bounds, need_coverage=False)
+        assert ok is True
+
+    def test_full_partition_accepted(self):
+        bounds = [(float("-inf"), 10.0), (10.0, 20.0), (20.0, float("inf"))]
+        ok, _ = scanner_a._validate_range_set(bounds, need_coverage=True)
+        assert ok is True
+
+    def test_overlapping_ranges_always_rejected(self):
+        # "greater than 45" convivendo com "between 45 and 50": duas podem
+        # vencer juntas, e a cesta de NOs passa a pagar n-2.
+        bounds = [(float("-inf"), 45.0), (45.0, 50.0), (45.0, float("inf"))]
+        assert scanner_a._validate_range_set(bounds, need_coverage=False)[0] is False
+        assert scanner_a._validate_range_set(bounds, need_coverage=True)[0] is False
+
+    def test_gap_in_middle_rejected_for_undersum(self):
+        bounds = [(float("-inf"), 10.0), (20.0, float("inf"))]
+        ok, motivo = scanner_a._validate_range_set(bounds, need_coverage=True)
+        assert ok is False and "buraco" in motivo
+
+    def test_single_range_rejected(self):
+        assert scanner_a._validate_range_set([(0.0, 10.0)], need_coverage=False)[0] is False
+
+    def test_generic_prefix_does_not_merge_unrelated_markets(self):
+        # "Will there be between 10 and 20 ..." tem prefixo generico; a chave
+        # de agrupamento precisa do sufixo para nao juntar assuntos diferentes.
+        q1 = "Will there be between 10 and 20 average daily transits of the Strait of Hormuz?"
+        q2 = "Will there be between 10 and 20 hurricanes in the Atlantic?"
+        m1 = scanner_a._RANGE_EXPR_RE.search(q1)
+        m2 = scanner_a._RANGE_EXPR_RE.search(q2)
+        chave1 = q1[:m1.start()].strip().lower() + "|" + q1[m1.end():].strip().lower()
+        chave2 = q2[:m2.start()].strip().lower() + "|" + q2[m2.end():].strip().lower()
+        assert chave1 != chave2
+
+    def test_over_in_prose_is_not_an_upper_bound(self):
+        # "over the next 30 days" nao e faixa: a palavra-chave exige numero.
+        q = "Will there be between 10 and 20 transits over the next 30 days?"
+        assert scanner_a._RANGE_UPPER_RE.search(q) is None

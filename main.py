@@ -9,7 +9,9 @@ import time
 from pathlib import Path
 
 from config import config
-from modules import scanner_a, oracle_b1, oracle_b2, oracle_b3, oracle_b4, oracle_b5, oracle_b5_pro, scanner_corr, tracker, phase_manager
+from modules import (scanner_a, oracle_b1, oracle_b2, oracle_b3, oracle_b4,
+                     oracle_b5, oracle_b5_pro, scanner_corr, tracker,
+                     phase_manager, risk)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -21,6 +23,15 @@ def _setup_logging():
     log_file = log_dir / f"{datetime.utcnow().strftime('%Y-%m-%d')}.log"
 
     fmt = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+
+    # O console do Windows abre em cp1252 e as mensagens têm travessão, acento e
+    # emoji (o ⚠️ do TAIL_RISK). Sem reconfigurar, o handler levanta
+    # UnicodeEncodeError e a linha de log some — inclusive avisos de risco.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     logging.basicConfig(
         level=logging.INFO,
         format=fmt,
@@ -46,6 +57,13 @@ def _run_loop(name: str, interval: int, scan_fn, execute_fn, client):
     logger.info("Módulo %s iniciado (intervalo=%ds mode=%s)", name, interval, config.MODE)
     while True:
         try:
+            # Kill switch armado: para de procurar oportunidade. Continuar
+            # varrendo so gastaria API e encheria o log de sinais que o portao
+            # de risco vai recusar um por um.
+            if risk.is_tripped():
+                logger.warning("Módulo %s pausado — kill switch armado", name)
+                time.sleep(interval)
+                continue
 
             signals = scan_fn()
             for signal in signals:
@@ -61,6 +79,9 @@ def _run_b4_loop():
                 config.B4_STANDBY_INTERVAL, config.B4_ACTIVE_INTERVAL, config.MODE)
     while True:
         try:
+            if risk.is_tripped():
+                time.sleep(config.B4_STANDBY_INTERVAL)
+                continue
             signals = oracle_b4.scan()
             for signal in signals:
                 oracle_b4.execute(signal, None)
@@ -76,6 +97,9 @@ def _run_b5_loop(client):
                 config.B5_SCAN_INTERVAL, config.MODE)
     while True:
         try:
+            if risk.is_tripped():
+                time.sleep(config.B5_SCAN_INTERVAL)
+                continue
             signals = oracle_b5.scan()
             for signal in signals:
                 oracle_b5.execute(signal, client)
@@ -96,15 +120,23 @@ def _phase_loop():
 
 
 def _tracker_loop():
-    """Verifica resoluções e imprime resumo a cada 6 horas."""
-    logger.info("Tracker iniciado (intervalo=6h)")
+    """
+    Verifica resolucoes e imprime o resumo.
+
+    Rodava a cada 6 horas, o que nao servia para mercados de 5 minutos: o
+    capital ficava marcado como exposto no ledger muito depois de o mercado ter
+    resolvido, e o portao de risco recusava entradas por exposicao que ja nao
+    existia. Agora o intervalo acompanha o modulo mais rapido em operacao.
+    """
+    interval = config.TRACKER_INTERVAL_S
+    logger.info("Tracker iniciado (intervalo=%ds)", interval)
     while True:
         try:
             tracker.check_resolutions()
             tracker.print_summary()
         except Exception as e:
             logger.exception("Erro inesperado no tracker: %s", e)
-        time.sleep(6 * 3600)
+        time.sleep(interval)
 
 
 def _build_client():
@@ -150,11 +182,31 @@ def main():
     _setup_logging()
     config.validate()
 
-    logger.info("=" * 60)
-    logger.info("Polymarket Bot iniciando | modo=%s | capital=$%.0f", config.MODE, config.TOTAL_CAPITAL)
-    logger.info("  A=$%.0f  B1=$%.0f  B2=$%.0f  Reserva=$%.0f",
-                config.CAPITAL_A, config.CAPITAL_B1, config.CAPITAL_B2, config.CAPITAL_RSRV)
-    logger.info("=" * 60)
+    logger.info("=" * 68)
+    logger.info("Polymarket Bot iniciando | modo=%s | capital=$%.0f",
+                config.MODE, config.TOTAL_CAPITAL)
+    logger.info("  Fee: modelo '%s' | preco do modulo A: %s | fill minimo: %.0f%%",
+                config.FEE_MODEL, config.A_PRICING_MODE, config.MIN_FILL_RATIO * 100)
+    logger.info("  Risco: %.0f%%/operacao | %.0f%%/modulo | %.0f%% exposto | "
+                "%d posicoes | dia %.0f%% | mes %.0f%% | kill %.0f%%",
+                config.MAX_TRADE_PCT * 100, config.MAX_MODULE_EXPOSURE_PCT * 100,
+                config.MAX_OPEN_EXPOSURE_PCT * 100, config.MAX_CONCURRENT_POSITIONS,
+                config.DAILY_LOSS_LIMIT_PCT * 100, config.MONTHLY_LOSS_LIMIT_PCT * 100,
+                config.MAX_DRAWDOWN_PCT * 100)
+    if config.MODE == "live":
+        logger.warning("  MODO LIVE | modulos autorizados a executar: %s",
+                       ", ".join(sorted(config.LIVE_MODULES)) or "nenhum")
+    else:
+        logger.info("  DRY-RUN — nenhuma ordem real sera enviada")
+    for line in risk.summary_lines():
+        logger.info("  %s", line)
+    logger.info("=" * 68)
+
+    if risk.is_tripped():
+        logger.critical(
+            "Kill switch armado — o bot vai rodar sem abrir posicao. "
+            "Para destravar: python -m modules.risk reset"
+        )
 
     client = _build_client()
 
@@ -217,8 +269,7 @@ def main():
     t_tracker.start()
 
     state = phase_manager.get_state()
-    logger.info("Fase atual: %d | A, B1 e B2 ativas para teste",
-                state["phase"])
+    logger.info("Fase atual: %d", state["phase"])
     logger.info("Módulos em execução: %s | Pressione Ctrl+C para encerrar.", ", ".join(active))
     try:
         while True:

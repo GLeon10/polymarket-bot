@@ -18,8 +18,8 @@ main.py
 ├── Módulo B3      — Oracle político (inconsistências em datas/candidatos)
 ├── Módulo B4      — Oracle esportivo ao vivo (ML vs. spread)
 ├── Módulo B5      — Spread capture BTC/ETH/SOL 5-min via WebSocket (ARB)
-├── Módulo B5 Pro  — 3 estratégias crypto 5-min em loop asyncio único
-│                    ARB · NEAR_RES · REPRICING
+├── Módulo B5 Pro  — [DESLIGADO] duplica o ARB do B5 nos mesmos mercados
+│                    NEAR_RES e REPRICING desligadas — ver docs/ESTRATEGIAS.md
 └── Módulo CORR    — Scanner de correlações lógicas entre mercados
 ```
 
@@ -109,6 +109,11 @@ polymarket_bot/
 ├── config/
 │   └── config.py            # Todos os parâmetros e thresholds
 ├── modules/
+│   ├── fees.py              # Modelo canônico de taxa taker
+│   ├── book.py              # Order book normalizado + VWAP por tamanho
+│   ├── arb.py               # Matemática de cestas (custo, payout, retorno)
+│   ├── risk.py              # Caixa, exposição, limites de perda, kill switch
+│   ├── executor.py          # Execução real (FOK por perna + desmonte)
 │   ├── scanner_a.py         # Módulo A
 │   ├── oracle_b1.py         # Módulo B1
 │   ├── oracle_b2.py         # Módulo B2
@@ -124,12 +129,16 @@ polymarket_bot/
 │   ├── rule_validator.py    # Validação de regras via keywords + Claude Haiku
 │   └── clob_utils.py        # Utilitários da API Polymarket
 ├── migrate_to_sheets.py     # Migração única CSV → Google Sheets
+├── migrate_csv_schema.py    # Migração dos CSVs para o esquema com pernas
+├── rotate_sheets.py         # Arquiva abas/CSVs como _v1 e recomeça do zero
 ├── tests/
-│   └── test_all.py          # 264 testes (todos os módulos)
+│   └── test_all.py          # 357 testes (todos os módulos)
 └── data/
     ├── trades/
-    │   ├── signals.csv      # Sinais emitidos (inclui pnl_est_usd por sinal)
-    │   └── resolved.csv     # Sinais resolvidos com P&L real
+    │   ├── signals.csv      # Sinais emitidos (com legs_json por sinal)
+    │   ├── resolved.csv     # Sinais resolvidos com P&L real por perna
+    │   ├── signals_v1.csv   # Arquivo morto — contabilidade antiga
+    │   └── ledger.json      # Caixa, exposição, limites e kill switch
     └── logs/
         ├── YYYY-MM-DD.log   # Log unificado do dia
         ├── scanner_a.log    # Log individual por módulo
@@ -194,24 +203,88 @@ python main.py
 
 ## Parâmetros principais
 
+### Economia
+
 | Parâmetro | Valor | Descrição |
 |-----------|-------|-----------|
-| `A_MAX_FEE` | 2.5% | Fee máxima aceita por mercado no módulo A |
-| `A_MIN_SPREAD` | 2% | Retorno mínimo líquido para sinal A |
-| `A_MAX_RESOLUTION_DAYS` | 60 dias | Janela de resolução máxima para módulo A |
-| `B1_MIN_DIVERGENCE` | 12% | Divergência mínima modelo vs. mercado (B1) |
-| `B2_MIN_DIVERGENCE` | 10% | Divergência mínima win-rate vs. mercado (B2) |
-| `B4_MIN_LIQUIDITY` | $150 | Liquidez mínima nos dois lados (B4) |
-| `B5_THRESHOLD` | 0.982 | Custo máximo p_up + p_down + fee (B5 / B5 Pro ARB) |
-| `B5_FEE_RATE` | 7.2% | Taxa taker crypto: `rate × p × (1−p)` |
-| `B5_TRADE_SIZE_USD` | $25/lado | Capital por lado por operação B5/B5 Pro |
-| `B5_NEAR_RES_PRICE_MIN` | 0.96 | Preço mínimo para NEAR_RES |
-| `B5_NEAR_RES_PRICE_MAX` | 0.995 | Preço máximo para NEAR_RES |
-| `B5_REPRICING_MIN_DIVERGENCE` | 6% | Divergência mínima fair vs. poly (REPRICING) |
-| `B5_REPRICING_MIN_LIQUIDITY` | $150 | Liquidez mínima no lado a comprar (REPRICING) |
-| `TOTAL_CAPITAL` | $500 | Capital total gerenciado pelo bot |
+| `FEE_MODEL` | `min` | Taxa taker: `rate × min(p, 1−p)`, fórmula publicada pela Polymarket |
+| `MIN_FILL_RATIO` | 95% | Fração do tamanho alvo que o livro precisa comportar |
+| `A_PRICING_MODE` | `ask` | Preço do módulo A: VWAP real do livro (`mid` só para diagnóstico) |
+| `A_MIN_SPREAD` | 2% | Retorno líquido mínimo (2 pernas) |
+| `A_SPREAD_PER_MARKET` | 0.5% | Exigência adicional por perna extra |
+| `A_MAX_FEE` | 1% | Fee máxima aceita por mercado |
+| `A_MAX_RESOLUTION_DAYS` | 30 dias | Janela de resolução do módulo A |
+| `B1_MIN_DIVERGENCE` | 20% | Divergência mínima modelo vs. mercado |
+| `B1_FORECAST_SIGMA_C` | 2.0 °C | Desvio do erro de previsão em 24h |
+| `B2_MIN_DIVERGENCE` | 15% | Divergência mínima win-rate vs. mercado |
+| `B4_MIN_LIQUIDITY` | $500 | Liquidez mínima nos dois lados |
+| `B5_MIN_NET_EDGE` | 1.5% | Lucro líquido mínimo por par YES+NO |
+| `B5_MIN_DEPTH_USD` | $150 | Profundidade mínima por lado |
+| `B5_FEE_RATE` | 7.2% | Taxa taker dos mercados cripto |
+
+### Risco — aplicado a todos os módulos, sem exceção
+
+| Parâmetro | Valor | O que faz |
+|-----------|-------|-----------|
+| `MAX_TRADE_PCT` | 5% | Teto por operação (% do equity) |
+| `MAX_MODULE_EXPOSURE_PCT` | 25% | Teto de exposição aberta por módulo |
+| `MAX_OPEN_EXPOSURE_PCT` | 50% | Teto de exposição aberta total |
+| `MAX_CONCURRENT_POSITIONS` | 8 | Posições abertas simultâneas |
+| `DAILY_LOSS_LIMIT_PCT` | −3% | Bloqueia novas entradas no dia |
+| `MONTHLY_LOSS_LIMIT_PCT` | −8% | Bloqueia novas entradas no mês |
+| `MAX_DRAWDOWN_PCT` | −15% | **Arma o kill switch** (destrava só manualmente) |
+| `TOTAL_CAPITAL` | $500 | Capital gerenciado |
+| `ALLOC_RSRV` | 10% | Reserva intocável |
 
 Todos os parâmetros estão em [config/config.py](config/config.py).
+
+---
+
+## Controle de risco
+
+Todo sinal passa pelo mesmo portão antes de virar posição:
+
+```python
+ok, motivo = risk.check_capacity(modulo, custo_usd)
+```
+
+As camadas, da mais branda para a mais dura: caixa disponível → teto por
+operação → teto por módulo → teto de exposição e nº de posições → perda diária
+→ perda mensal → drawdown.
+
+O estado fica em `data/trades/ledger.json`: caixa, exposição aberta por
+posição, P&L realizado por dia/mês/módulo e o pico de equity.
+
+```bash
+python -m modules.risk          # status atual
+python -m modules.risk reset    # desarma o kill switch
+```
+
+O kill switch é persistente e **só sai com intervenção manual**. Se o bot se
+destravasse sozinho, não seria um stop.
+
+---
+
+## Contabilidade
+
+Cada sinal grava suas **pernas** — mercado, lado comprado, preço de execução,
+shares e fee. Na resolução, cada perna é consultada no CLOB e o P&L é o que a
+cesta de fato pagou:
+
+```
+pnl = Σ(shares das pernas vencedoras) − custo_total_pago
+```
+
+Isso importa porque a versão anterior calculava, para qualquer trade marcado
+como arbitragem, `pnl = size_usd × edge` — o edge teórico do momento da
+detecção, independentemente do que o mercado resolveu. Nenhum módulo de
+arbitragem conseguia registrar prejuízo: win rate 100% por construção, gatilho
+de Fase 2 alimentado por lucro fabricado e stop-loss cego.
+
+Uma arbitragem mal formada — pernas que não eram mutuamente exclusivas, faixa
+não exaustiva, perna que não preencheu — agora aparece como prejuízo, que é o
+ponto. Quando o edge realizado fica muito abaixo do prometido, o tracker emite
+`WARNING`: é o sinal mais honesto de que um detector está errado.
 
 ---
 
@@ -290,7 +363,37 @@ Para configurar o bot do Telegram:
 
 ## Google Sheets
 
-Os sinais e resoluções são espelhados automaticamente em uma planilha Google (abas **Signals** e **Resolved**). Configuração:
+Os sinais e resoluções são espelhados automaticamente em uma planilha Google.
+
+**Abas:**
+
+| Aba | Conteúdo |
+|-----|----------|
+| `Signals` | sinais emitidos, esquema por pernas (`legs_json`, `cost_usd`, `fee_usd`) |
+| `Resolved` | resoluções com P&L real (`payout_usd`, `pnl_usd`, `edge_realizado`) |
+| `Signals_v1` | arquivo morto — contabilidade antiga |
+| `Resolved_v1` | arquivo morto — contabilidade antiga |
+
+As abas `_v1` guardam o que foi gravado enquanto o P&L de arbitragem era
+`size_usd × edge`, calculado na detecção e sem olhar a resolução. É por isso
+que lá **38 de 38 operações aparecem como WIN**: a coluna que dizia o que
+aconteceu no mercado não entrava na conta. Elas ficam intactas para consulta,
+mas não servem para avaliar resultado — conte só o que for gravado nas abas
+novas.
+
+Para arquivar as abas atuais e começar do zero no esquema novo:
+
+```bash
+python rotate_sheets.py --dry-run   # mostra o que faria
+python rotate_sheets.py             # renomeia para _v1 e cria as novas
+```
+
+O mesmo vale para os CSVs locais: `signals.csv` vira `signals_v1.csv` e o
+tracker cria o novo no primeiro sinal. Se um CSV ou aba ficar com o esquema
+antigo, a gravação é recusada com erro explícito em vez de deslocar as colunas
+em silêncio.
+
+**Configuração inicial:**
 
 1. Crie um projeto no [Google Cloud Console](https://console.cloud.google.com) e ative as APIs **Google Sheets** e **Google Drive**
 2. Crie uma **Service Account**, baixe o JSON e salve como `credentials.json` na raiz do projeto
@@ -306,7 +409,7 @@ Os sinais e resoluções são espelhados automaticamente em uma planilha Google 
 python -m pytest tests/test_all.py -v
 ```
 
-264 testes cobrindo todos os módulos: detecção, filtros, WebSocket, Binance feed, fair value, integração com mocks e casos de borda.
+357 testes: detecção, filtros, modelo de fee, normalização do order book, portão de risco, contabilidade por pernas, cadeados do modo live, WebSocket, Binance feed, fair value e casos de borda.
 
 ---
 
@@ -357,8 +460,39 @@ cat ~/polymarket_bot/data/trades/resolved.csv
 
 ---
 
-## Segurança
+## Segurança e modo live
 
 - **Nunca compartilhe sua `PRIVATE_KEY` ou `credentials.json`** — ambos estão no `.gitignore`
-- O bot opera em `dry_run` por padrão — não executa trades reais
-- Para operar em `live`, altere `MODE=live` no `.env` e certifique-se de que a wallet tem fundos em USDC na rede Polygon
+- O bot opera em `dry_run` por padrão e **não envia nenhuma ordem real**
+
+Ligar o modo live exige três chaves simultâneas, de propósito:
+
+```env
+MODE=live
+LIVE_CONFIRMED=true          # confirmação explícita
+LIVE_MODULES=A,B4            # whitelist — o resto segue em dry-run
+```
+
+Um módulo fora de `LIVE_MODULES` continua em dry-run mesmo com `MODE=live`.
+`config.validate()` recusa subir se qualquer uma das três faltar, ou se as
+credenciais da API não estiverem completas.
+
+Antes de enviar qualquer ordem, o `executor`:
+
+1. **Revalida** o preço no livro — entre detectar e executar passam segundos, e
+   se o edge caiu abaixo de `EXEC_MIN_EDGE` nenhuma ordem sai.
+2. Usa **FOK** por perna (fill-or-kill): ou a perna inteira preenche, ou nada.
+   Perna meio-preenchida numa arbitragem é posição direcional nua.
+3. **Desmonta** o que já preencheu se uma perna falhar, vendendo a mercado. Se
+   o desmonte falhar, arma o kill switch e notifica.
+
+### Antes de operar com dinheiro real
+
+- [ ] Confirmar a fórmula de fee vigente na documentação da Polymarket
+      (`FEE_MODEL` assume `min(p, 1−p)`; `auto` usa o mais caro dos dois)
+- [ ] Conferir a ordenação de `asks` no `/book` contra a API real —
+      `modules/book.py` reordena localmente, então funciona nos dois casos,
+      mas vale verificar em produção
+- [ ] Acumular P&L resolvido honesto em dry-run tempo suficiente para ver o
+      edge realizado acompanhar o prometido
+- [ ] Começar por um módulo só em `LIVE_MODULES`, com `TOTAL_CAPITAL` reduzido
