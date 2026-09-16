@@ -1728,15 +1728,43 @@ class TestOracleB5:
         end = datetime.now(timezone.utc) + timedelta(seconds=300 - 280)
         assert _in_entry_window(end) is False
 
+    # Os limites exatos precisam do relogio congelado. Montar `end` com uma
+    # leitura e deixar a funcao fazer outra empurra o elapsed alguns
+    # microssegundos alem do limite: o teste virava corrida contra o relogio,
+    # passando numa maquina rapida e falhando numa carregada.
+
+    @staticmethod
+    def _congelado(segundos_ate_o_fim):
+        agora = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        return agora, agora + timedelta(seconds=segundos_ate_o_fim)
+
     def test_in_window_at_boundary_min(self):
-        # exatamente T+30s
-        end = datetime.now(timezone.utc) + timedelta(seconds=300 - 30)
-        assert _in_entry_window(end) is True
+        # exatamente T+30s apos a abertura
+        agora, end = self._congelado(300 - 30)
+        with patch("modules.oracle_b5.datetime") as dt:
+            dt.now.return_value = agora
+            assert _in_entry_window(end) is True
 
     def test_in_window_at_boundary_max(self):
-        # exatamente T+240s
-        end = datetime.now(timezone.utc) + timedelta(seconds=300 - 240)
-        assert _in_entry_window(end) is True
+        # exatamente T+240s apos a abertura
+        agora, end = self._congelado(300 - 240)
+        with patch("modules.oracle_b5.datetime") as dt:
+            dt.now.return_value = agora
+            assert _in_entry_window(end) is True
+
+    def test_not_in_window_one_second_past_max(self):
+        # T+241s: fora por um segundo
+        agora, end = self._congelado(300 - 241)
+        with patch("modules.oracle_b5.datetime") as dt:
+            dt.now.return_value = agora
+            assert _in_entry_window(end) is False
+
+    def test_not_in_window_one_second_before_min(self):
+        # T+29s: ainda nao entrou
+        agora, end = self._congelado(300 - 29)
+        with patch("modules.oracle_b5.datetime") as dt:
+            dt.now.return_value = agora
+            assert _in_entry_window(end) is False
 
     # ── Detecção de mercados ──────────────────────────────────────────────────
 
