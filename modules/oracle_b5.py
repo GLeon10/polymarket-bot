@@ -347,6 +347,8 @@ def scan() -> list[CryptoSpreadSignal]:
         snapshot = dict(_watched)
 
     in_window = 0
+    best_ws: float | None = None     # melhor edge no topo do livro (WS)
+    best_exec: float | None = None   # melhor edge ja com VWAP e profundidade
     for mid, info in snapshot.items():
         with _exec_lock:
             if mid in _executed:
@@ -359,8 +361,11 @@ def scan() -> list[CryptoSpreadSignal]:
         # Passo 1 — triagem barata pelo WebSocket. Só o melhor ask, sem tamanho.
         p_up_ws   = _get_ask(info["yes_id"])
         p_down_ws = _get_ask(info["no_id"])
-        if p_up_ws > 0 and p_down_ws > 0 and _net_edge(p_up_ws, p_down_ws) <= 0:
-            continue
+        if p_up_ws > 0 and p_down_ws > 0:
+            e_ws = _net_edge(p_up_ws, p_down_ws)
+            best_ws = e_ws if best_ws is None else max(best_ws, e_ws)
+            if e_ws <= 0:
+                continue
 
         # Passo 2 — confirmação no livro, com profundidade para o tamanho real.
         #
@@ -387,6 +392,7 @@ def scan() -> list[CryptoSpreadSignal]:
             continue
 
         edge = _net_edge(p_up, p_down)
+        best_exec = edge if best_exec is None else max(best_exec, edge)
         if edge < config.B5_MIN_NET_EDGE:
             continue
 
@@ -415,9 +421,15 @@ def scan() -> list[CryptoSpreadSignal]:
         ))
 
     if not signals:
+        # "0 mercados vigiados" e "mercados sem edge" sao problemas opostos:
+        # o primeiro e descoberta de mercado quebrada; o segundo, mercado
+        # eficiente. O melhor edge visto separa os dois casos no log.
+        fmt = lambda v: "n/d" if v is None else f"{v:.2%}"
         logger.info(
-            "B5: %d mercado(s) vigiados | %d em janela | sem sinais",
-            len(snapshot), in_window,
+            "B5: %d mercado(s) vigiados | %d em janela | sem sinais | "
+            "melhor edge topo-do-livro=%s | melhor edge executavel=%s (exigido %.2f%%)",
+            len(snapshot), in_window, fmt(best_ws), fmt(best_exec),
+            config.B5_MIN_NET_EDGE * 100,
         )
 
     return signals

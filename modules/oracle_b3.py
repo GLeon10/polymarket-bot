@@ -64,6 +64,16 @@ _SOURCE_KEYWORDS = [
 
 _rules_cache: dict[str, str] = {}
 
+_funnel = arb.Funnel()
+
+
+def _liq_ok(min_liq: float) -> bool:
+    _funnel.hit("triagem_mid")
+    if min_liq < config.B3_MIN_LIQUIDITY:
+        _funnel.drop("liquidez<$%d" % config.B3_MIN_LIQUIDITY)
+        return False
+    return True
+
 
 # ── Data class de sinal ───────────────────────────────────────────────────────
 
@@ -221,11 +231,14 @@ def _make_signal(sig_type: int, description: str, markets: list[dict],
 
     exec_prices, cost = arb.price_basket(markets, outcomes, budget)
     if not exec_prices or cost <= 0:
+        _funnel.drop("sem_profundidade_no_livro")
         return None
 
     fee_rates = [arb.market_fee_rate(m) for m in markets]
     net_ret   = arb.basket_return(exec_prices, min_payout, fee_rates)
+    _funnel.near_miss(net_ret, arb.min_required_return(len(markets)), description)
     if net_ret < arb.min_required_return(len(markets)):
+        _funnel.drop("retorno_no_livro<minimo")
         logger.debug(
             "[B3] Descartado — retorno real %.2f%% (mid sugeria %.2f%%): %s",
             net_ret * 100, spread * 100, description[:60],
@@ -291,10 +304,11 @@ def _detect_sum(candidates: list[dict]) -> list[PoliticsSignal]:
         if ret < config.B3_MIN_SPREAD:
             continue
         min_liq = min(_get_min_liquidity(m) for m in group)
-        if min_liq < config.B3_MIN_LIQUIDITY:
+        if not _liq_ok(min_liq):
             continue
         exc, motivo = arb.is_exclusive_event(event)
         if not exc:
+            _funnel.drop("evento_nao_exclusivo")
             logger.info("[B3] 4a descartado — %s: '%s'", motivo, event[:60])
             continue
 
@@ -386,7 +400,7 @@ def _detect_dates(candidates: list[dict]) -> list[PoliticsSignal]:
                 continue
             seen_pairs.add(pair_key)
             min_liq = min(_get_min_liquidity(m_early), _get_min_liquidity(m_late))
-            if min_liq < config.B3_MIN_LIQUIDITY:
+            if not _liq_ok(min_liq):
                 continue
             res_ok, res_notes = _check_resolution_rules(
                 [m_early["condition_id"], m_late["condition_id"]]
@@ -450,7 +464,7 @@ def _detect_candidate_party(candidates: list[dict]) -> list[PoliticsSignal]:
             continue
         seen_pairs.add(pair_key)
         min_liq = min(_get_min_liquidity(market), _get_min_liquidity(m_party))
-        if min_liq < config.B3_MIN_LIQUIDITY:
+        if not _liq_ok(min_liq):
             continue
         cand_name = mat.group(1)[:30]
         res_ok, res_notes = _check_resolution_rules(
@@ -486,6 +500,7 @@ def _log_valid(sig: PoliticsSignal) -> None:
 
 def scan() -> list[PoliticsSignal]:
     _rules_cache.clear()
+    _funnel.reset()
 
     all_markets = clob_utils.fetch_sampling_markets()
     candidates  = _filter_politics(all_markets)
@@ -519,6 +534,7 @@ def scan() -> list[PoliticsSignal]:
     else:
         logger.info("[B3] %d mercados | %d candidatos | sem sinais",
                     len(all_markets), len(candidates))
+    logger.info(_funnel.summary("B3"))
 
     return valid
 

@@ -22,11 +22,61 @@ arbitragens de 2% que não existiam no livro.
 
 import logging
 import re
+from collections import Counter
 
 from config import config
 from modules import book, clob_utils, fees
 
 logger = logging.getLogger("arb")
+
+
+# ── Funil de descartes ────────────────────────────────────────────────────────
+
+class Funnel:
+    """
+    Conta, por varredura, onde cada oportunidade morreu.
+
+    Existe porque todos os motivos de descarte eram `logger.debug` e o serviço
+    roda em INFO: depois de semanas sem nenhum sinal, o log só dizia "0
+    válidos", sem separar três situações muito diferentes —
+
+      * nada passou nem na triagem pelo mid     → o mercado está eficiente
+      * passou no mid e morreu no livro         → o spread executável come o edge
+      * morreu por liquidez/exclusividade/regra → filtro de qualidade
+
+    `melhor retorno` é o quase-acerto: o maior retorno líquido já precificado
+    no livro nesta varredura e o mínimo exigido. Se o melhor é 0,4% contra 3,5%
+    exigidos, o mercado não tem arbitragem; se é 3,3%, o limiar está apertado.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.counts: Counter = Counter()
+        self.best_return: float | None = None
+        self.best_needed: float = 0.0
+        self.best_desc: str = ""
+
+    def hit(self, chave: str) -> None:
+        self.counts[chave] += 1
+
+    drop = hit
+
+    def near_miss(self, retorno: float, exigido: float, desc: str) -> None:
+        if self.best_return is None or retorno > self.best_return:
+            self.best_return, self.best_needed, self.best_desc = retorno, exigido, desc
+
+    def summary(self, tag: str) -> str:
+        c = self.counts
+        partes = [f"{k}={v}" for k, v in sorted(c.items()) if k != "triagem_mid"]
+        linha = f"[{tag}] funil | passou triagem no mid={c.get('triagem_mid', 0)}"
+        if partes:
+            linha += " | " + " | ".join(partes)
+        if self.best_return is not None:
+            linha += (f" | melhor retorno no livro={self.best_return:.2%}"
+                      f" (exigido {self.best_needed:.2%}): {self.best_desc[:50]}")
+        return linha
 
 
 # ── Exclusividade mútua ───────────────────────────────────────────────────────

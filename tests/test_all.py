@@ -48,6 +48,8 @@ from modules import tracker as tracker_mod
 # com o mid e as asserticoes de spread continuem medindo a LOGICA do detector,
 # nao o slippage. Testes de profundidade usam _fake_books(..., size=...) baixo.
 
+_REAL_BOOK_FETCH = book_mod.fetch   # a fixture autouse troca por _fake_fetch
+
 _FAKE_PRICES: dict[str, float] = {}
 _FAKE_SIZE: dict[str, float] = {}
 
@@ -2870,3 +2872,137 @@ class TestRangeValidation:
         # "over the next 30 days" nao e faixa: a palavra-chave exige numero.
         q = "Will there be between 10 and 20 transits over the next 30 days?"
         assert scanner_a._RANGE_UPPER_RE.search(q) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Observabilidade — funil de descartes e falhas de livro
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestFunnel:
+    """
+    Depois de 36 dias sem sinal, o log so dizia "0 validos": todo motivo de
+    descarte era DEBUG e o servico roda em INFO. O funil separa mercado
+    eficiente, spread executavel e filtro de qualidade.
+    """
+
+    def test_empty_funnel_reads_zero(self):
+        f = arb_mod.Funnel()
+        assert "passou triagem no mid=0" in f.summary("A")
+
+    def test_counts_by_reason(self):
+        f = arb_mod.Funnel()
+        f.hit("triagem_mid"); f.hit("triagem_mid")
+        f.drop("liquidez<$100")
+        out = f.summary("A")
+        assert "passou triagem no mid=2" in out and "liquidez<$100=1" in out
+
+    def test_near_miss_keeps_the_best(self):
+        f = arb_mod.Funnel()
+        f.near_miss(0.004, 0.035, "ruim")
+        f.near_miss(0.031, 0.035, "quase")
+        f.near_miss(0.010, 0.035, "medio")
+        out = f.summary("A")
+        assert "3.10%" in out and "quase" in out and "3.50%" in out
+
+    def test_near_miss_accepts_negative_returns(self):
+        f = arb_mod.Funnel()
+        f.near_miss(-0.05, 0.02, "prejuizo")
+        assert f.best_return == pytest.approx(-0.05)
+
+    def test_reset_clears_everything(self):
+        f = arb_mod.Funnel()
+        f.drop("x"); f.near_miss(0.01, 0.02, "d")
+        f.reset()
+        assert not f.counts and f.best_return is None
+
+    def test_scan_reports_efficient_market(self, caplog):
+        # soma de YES = 100%: nada a arbitrar, e o funil tem de dizer isso
+        import logging
+        with caplog.at_level(logging.INFO, logger="scanner_a"):
+            TestScannerA._run([
+                TestScannerA._market("Will Alice win the 2026 seoul mayoral election?", 0.45, "a1"),
+                TestScannerA._market("Will Bob win the 2026 seoul mayoral election?", 0.35, "b1"),
+                TestScannerA._market("Will Carol win the 2026 seoul mayoral election?", 0.20, "c1"),
+            ])
+        assert any("funil | passou triagem no mid=0" in r.getMessage() for r in caplog.records)
+
+    def test_scan_reports_spread_killing_the_edge(self, caplog, monkeypatch):
+        # soma 120% no mid, mas o livro cobra 6c acima: morre no preco executavel
+        import logging
+        ms = [TestScannerA._market("Will Alice win the 2026 seoul mayoral election?", 0.50, "a2"),
+              TestScannerA._market("Will Bob win the 2026 seoul mayoral election?", 0.40, "b2"),
+              TestScannerA._market("Will Carol win the 2026 seoul mayoral election?", 0.30, "c2")]
+        for m in ms:
+            for t in m["tokens"]:
+                _FAKE_PRICES[t["token_id"]] = min(float(t["price"]) + 0.06, 0.99)
+        with caplog.at_level(logging.INFO, logger="scanner_a"):
+            with patch("modules.scanner_a.clob_utils.fetch_sampling_markets", return_value=ms),                  patch("modules.scanner_a.clob_utils.get_orderbook_liquidity", return_value=500.0),                  patch("modules.scanner_a._fetch_resolution_rules", return_value=_RES_OK),                  patch("modules.scanner_a.rule_validator.assess", return_value=("HIGH", "t")):
+                assert scanner_a.scan() == []
+        linha = next(r.getMessage() for r in caplog.records if "funil" in r.getMessage())
+        assert "passou triagem no mid=1" in linha
+        assert "retorno_no_livro<minimo=1" in linha and "melhor retorno no livro" in linha
+
+
+class TestBookStats:
+    """Falha de livro devolve None, igual a 'sem profundidade'. Sem contagem,
+    rate limit e rede caida viram 'falta de liquidez' sem ninguem perceber."""
+
+    def setup_method(self):
+        book_mod.take_stats()
+
+    @staticmethod
+    def _resp(status=200, payload=None):
+        from unittest.mock import MagicMock
+        import requests as rq
+        r = MagicMock(); r.status_code = status
+        if status >= 400:
+            r.raise_for_status.side_effect = rq.HTTPError(response=r)
+        else:
+            r.raise_for_status.return_value = None
+        r.json.return_value = payload if payload is not None else {"bids": [], "asks": []}
+        return r
+
+    def test_success_counts_ok(self):
+        with patch("modules.book.requests.get", return_value=self._resp()):
+            assert _REAL_BOOK_FETCH("tok") is not None
+        assert book_mod.take_stats() == {"ok": 1}
+
+    def test_rate_limit_is_counted_by_status(self):
+        with patch("modules.book.requests.get", return_value=self._resp(429)):
+            assert _REAL_BOOK_FETCH("tok") is None
+        assert book_mod.take_stats() == {"falha_http_429": 1}
+
+    def test_server_error_is_counted_by_status(self):
+        with patch("modules.book.requests.get", return_value=self._resp(503)):
+            _REAL_BOOK_FETCH("tok")
+        assert book_mod.take_stats() == {"falha_http_503": 1}
+
+    def test_timeout_is_counted(self):
+        import requests as rq
+        with patch("modules.book.requests.get", side_effect=rq.Timeout()):
+            assert _REAL_BOOK_FETCH("tok") is None
+        assert book_mod.take_stats() == {"falha_timeout": 1}
+
+    def test_connection_error_is_counted(self):
+        import requests as rq
+        with patch("modules.book.requests.get", side_effect=rq.ConnectionError()):
+            assert _REAL_BOOK_FETCH("tok") is None
+        assert book_mod.take_stats() == {"falha_conexao": 1}
+
+    def test_take_stats_resets(self):
+        with patch("modules.book.requests.get", return_value=self._resp()):
+            _REAL_BOOK_FETCH("tok")
+        book_mod.take_stats()
+        assert book_mod.take_stats() == {}
+
+    def test_empty_token_is_not_counted_as_failure(self):
+        assert _REAL_BOOK_FETCH("") is None
+        assert book_mod.take_stats() == {}
+
+    def test_parses_real_api_format_worst_first(self):
+        # strings e asks do PIOR para o MELHOR — o formato que a API devolve
+        payload = {"bids": [{"price": "0.40", "size": "100"}],
+                   "asks": [{"price": "0.60", "size": "10"}, {"price": "0.50", "size": "10"}]}
+        with patch("modules.book.requests.get", return_value=self._resp(payload=payload)):
+            b = _REAL_BOOK_FETCH("tok")
+        assert b.best_ask == 0.50 and b.best_bid == 0.40

@@ -14,6 +14,8 @@ profundidade acumulada e preço médio de execução (VWAP) para um tamanho alvo
 """
 
 import logging
+import threading
+from collections import Counter
 from dataclasses import dataclass, field
 
 import requests
@@ -21,6 +23,26 @@ import requests
 from config import config
 
 logger = logging.getLogger("book")
+
+# Contagem de resultados de /book. Falha de livro e silenciosa por desenho
+# (devolve None), o que a torna indistinguivel de "sem profundidade". Com
+# rate limit ou rede caida, TODA cesta morreria como "sem liquidez" e ninguem
+# veria. Estas contagens fazem a diferenca aparecer no resumo da varredura.
+_stats: Counter = Counter()
+_stats_lock = threading.Lock()
+
+
+def _count(chave: str) -> None:
+    with _stats_lock:
+        _stats[chave] += 1
+
+
+def take_stats() -> dict:
+    """Devolve e zera as contagens acumuladas desde a ultima chamada."""
+    with _stats_lock:
+        snap = dict(_stats)
+        _stats.clear()
+    return snap
 
 
 @dataclass
@@ -87,9 +109,22 @@ def fetch(token_id: str, timeout: float = 5.0) -> Book | None:
         )
         resp.raise_for_status()
         data = resp.json()
-    except (requests.RequestException, ValueError) as e:
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", "?")
+        _count(f"falha_http_{code}")
+        logger.debug("book: HTTP %s para token %s", code, token_id[:12])
+        return None
+    except requests.Timeout:
+        _count("falha_timeout")
+        return None
+    except requests.RequestException as e:
+        _count("falha_conexao")
         logger.debug("book: falha ao buscar token %s — %s", token_id[:12], e)
         return None
+    except ValueError:
+        _count("falha_json")
+        return None
+    _count("ok")
 
     return Book(
         token_id = token_id,

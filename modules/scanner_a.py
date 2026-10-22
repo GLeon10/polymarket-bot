@@ -80,6 +80,21 @@ _SOURCE_KEYWORDS = [
 
 _rules_cache: dict[str, str] = {}
 
+# Funil de descartes da varredura corrente (ver arb.Funnel).
+_funnel = arb.Funnel()
+
+
+def _liq_ok(min_liq: float) -> bool:
+    """
+    Triagem de liquidez. Chegar aqui significa que a cesta JA passou na
+    triagem pelo mid — por isso e este o ponto que conta `triagem_mid`.
+    """
+    _funnel.hit("triagem_mid")
+    if min_liq < config.A_MIN_LIQUIDITY:
+        _funnel.drop("liquidez<$%d" % config.A_MIN_LIQUIDITY)
+        return False
+    return True
+
 
 # ── Data class de sinal ───────────────────────────────────────────────────────
 
@@ -420,13 +435,16 @@ def _make_signal(sig_type: int, description: str, markets: list[dict],
 
     exec_prices, cost = _price_basket(markets, outcomes, budget)
     if not exec_prices or cost <= 0:
+        _funnel.drop("sem_profundidade_no_livro")
         logger.debug("[A] Descartado — sem profundidade para $%.0f: %s", budget, description[:60])
         return None
 
     fee_rates = [arb.market_fee_rate(m) for m in markets]
     net_ret   = arb.basket_return(exec_prices, min_payout, fee_rates)
     min_ret   = arb.min_required_return(len(markets))
+    _funnel.near_miss(net_ret, min_ret, description)
     if net_ret < min_ret:
+        _funnel.drop("retorno_no_livro<minimo")
         logger.debug(
             "[A] Descartado — retorno real %.2f%% < mínimo %.2f%% (estimado no mid: %.2f%%): %s",
             net_ret * 100, min_ret * 100, spread * 100, description[:60],
@@ -504,6 +522,7 @@ def _detect_type1(candidates: list[dict]) -> list[ArbSignal]:
         # tempo, e a soma passar de 100% e o esperado, nao ineficiencia.
         exc, motivo = arb.is_exclusive_event(event)
         if not exc:
+            _funnel.drop("evento_nao_exclusivo")
             logger.info("[A] Tipo1 descartado — %s: '%s'", motivo, event[:60])
             continue
 
@@ -512,6 +531,7 @@ def _detect_type1(candidates: list[dict]) -> list[ArbSignal]:
         # campo pode ter um "outro/nenhum" que não vira mercado. Sem cobertura
         # comprovada, isso é venda de cauda, não arbitragem.
         if not oversum and not config.A_ALLOW_UNDERSUM_WITHOUT_COVERAGE:
+            _funnel.drop("undersum_sem_cobertura")
             logger.debug(
                 "[A] Tipo1 UNDERSUM ignorado — exaustividade não comprovada: '%s' (%d candidatos)",
                 event, n,
@@ -519,7 +539,7 @@ def _detect_type1(candidates: list[dict]) -> list[ArbSignal]:
             continue
 
         min_liq = min(_get_min_liquidity(m) for m in group)
-        if min_liq < config.A_MIN_LIQUIDITY:
+        if not _liq_ok(min_liq):
             continue
         direction  = "OVERSUM" if oversum else "UNDERSUM"
         action     = "comprar NO em todos" if oversum else "comprar YES em todos"
@@ -592,7 +612,7 @@ def _detect_ranges(candidates: list[dict]) -> list[ArbSignal]:
             continue
 
         min_liq = min(_get_min_liquidity(m) for m in group)
-        if min_liq < config.A_MIN_LIQUIDITY:
+        if not _liq_ok(min_liq):
             continue
         direction  = "OVERSUM" if oversum else "UNDERSUM"
         action     = "comprar NO em todos" if oversum else "comprar YES em todos"
@@ -644,7 +664,7 @@ def _detect_type2(candidates: list[dict]) -> list[ArbSignal]:
             if spread < config.A_MIN_SPREAD:
                 continue
             min_liq = min(_get_min_liquidity(market), _get_min_liquidity(m_ind))
-            if min_liq < config.A_MIN_LIQUIDITY:
+            if not _liq_ok(min_liq):
                 continue
             res_ok, res_notes = _check_resolution_rules(
                 [market["condition_id"], m_ind["condition_id"]]
@@ -702,7 +722,7 @@ def _detect_thresholds(candidates: list[dict]) -> list[ArbSignal]:
                 continue
             seen_pairs.add(pair_key)
             min_liq = min(_get_min_liquidity(m_low), _get_min_liquidity(m_high))
-            if min_liq < config.A_MIN_LIQUIDITY:
+            if not _liq_ok(min_liq):
                 continue
             res_ok, res_notes = _check_resolution_rules(
                 [m_low["condition_id"], m_high["condition_id"]]
@@ -761,7 +781,7 @@ def _detect_dates(candidates: list[dict]) -> list[ArbSignal]:
                 continue
             seen_pairs.add(pair_key)
             min_liq = min(_get_min_liquidity(m_early), _get_min_liquidity(m_late))
-            if min_liq < config.A_MIN_LIQUIDITY:
+            if not _liq_ok(min_liq):
                 continue
             res_ok, res_notes = _check_resolution_rules(
                 [m_early["condition_id"], m_late["condition_id"]]
@@ -818,7 +838,7 @@ def _detect_type3(candidates: list[dict]) -> list[ArbSignal]:
                     continue
                 seen_pairs.add(pair_key)
                 min_liq = min(_get_min_liquidity(m_strong), _get_min_liquidity(m_weak))
-                if min_liq < config.A_MIN_LIQUIDITY:
+                if not _liq_ok(min_liq):
                     continue
                 res_ok, res_notes = _check_resolution_rules(
                     [m_strong["condition_id"], m_weak["condition_id"]]
@@ -853,6 +873,8 @@ def _log_valid(sig: ArbSignal) -> None:
 
 def scan() -> list[ArbSignal]:
     _rules_cache.clear()
+    _funnel.reset()
+    book.take_stats()          # descarta o acumulado de antes desta varredura
 
     all_markets = clob_utils.fetch_sampling_markets()
     candidates  = _filter_candidates(all_markets)
@@ -870,6 +892,8 @@ def scan() -> list[ArbSignal]:
     all_signals.extend(_detect_type3(candidates))      # win title > qualify
 
     res_ok = [s for s in all_signals if s.resolution_ok]
+    if len(all_signals) > len(res_ok):
+        _funnel.counts["regras_de_resolucao"] += len(all_signals) - len(res_ok)
 
     # Assess rule quality; LOW signals are discarded (logged at INFO when no LLM key)
     valid: list[ArbSignal] = []
@@ -894,6 +918,19 @@ def scan() -> list[ArbSignal]:
         "[A] %d mercados | %d candidatos | %d brutos | %d LOW descartados | %d válido(s)",
         len(all_markets), len(candidates), len(res_ok), low_count, len(valid),
     )
+    logger.info(_funnel.summary("A"))
+
+    # Falha de livro e silenciosa (devolve None) e se parece com "sem
+    # liquidez". Se houve falha, sobe para WARNING — e o que denuncia rate
+    # limit ou rede caida.
+    stats = book.take_stats()
+    falhas = {k: v for k, v in stats.items() if k.startswith("falha_")}
+    if falhas:
+        logger.warning("[A] livro: %d ok, %d FALHAS %s — descartes por "
+                       "'sem_profundidade' podem ser falha de API, nao falta de liquidez",
+                       stats.get("ok", 0), sum(falhas.values()), falhas)
+    else:
+        logger.info("[A] livro: %d consultas, 0 falhas", stats.get("ok", 0))
 
     return valid
 
